@@ -10,7 +10,7 @@
 
 1. [HANDOFF.md](HANDOFF.md): 2台のPCでの再開・終了手順、現在地、次の一手。
 2. [AGENTS.md](AGENTS.md): Claude/Codex等で共通に守る開発ルール。
-3. [paper/manuscript.md](paper/manuscript.md): 英語論文草稿、関連研究、評価計画。
+3. 論文草稿: [日本語版](paper/manuscript-ja.md) / [英語版](paper/manuscript.md)。関連研究、提案方式、評価計画。
 
 GitHubを共通の正本にする。作業終了時にコミットしてpushし、別PCではfetch/pullしてから再開する。ローカルstashだけで引き継がない。
 
