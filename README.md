@@ -16,7 +16,9 @@ GitHubを共通の正本にする。作業終了時にコミットしてpushし�
 
 ## 実機なしで動かす
 
-C++17対応コンパイラのみ必要。Linux/WSLの例:
+Python 3.9以上とC++17コンパイラがあれば、`python tools/host_lab.py check`でコア・再生・模擬APIを一括検証できます。[HOST_LAB.md](HOST_LAB.md)に再生ログ、模擬API、帰宅後の接続手順をまとめています。
+
+コア単体を検証するLinux/WSLの例:
 
 ```sh
 g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude tests/host.cpp -o /tmp/stackchan-host
