@@ -111,6 +111,9 @@ static M5Canvas canvas(&M5.Display);   // off-screen frame: compose camera + ove
 static uint8_t gray[kW * kH];
 static bool cameraOk = false, wifiOk = false;
 static bool debugView = false;   // false: Stack-chan's face; true: camera preview with detection box
+static bool streamOn = false;    // camera snapshots over the LAN; off at every boot, shown on the device screen
+static int boxX = 0, boxY = 0, boxS = 0;   // last detection in 320x240 camera pixels
+static uint32_t boxMs = 0;
 static uint64_t activeId = 0;
 static char answer[kMaxAnswerBytes + 1] = "";
 static char status[48] = "";
@@ -183,16 +186,29 @@ static const char kPage[] PROGMEM = R"HTML(<!doctype html><html lang="ja"><meta 
 button{font-size:1.1em;padding:.6em 1em;margin:.2em}input{width:100%;font-size:1.1em;padding:.5em;box-sizing:border-box}
 #st{background:#eee;padding:.6em;border-radius:6px;white-space:pre-wrap}</style>
 <h2>Stack-chan</h2><div id="st">...</div>
+<div style="position:relative;width:320px;height:240px;margin:.6em 0;background:#222;color:#aaa">
+<img id="cam" width="320" height="240" style="display:none;position:absolute;left:0;top:0">
+<canvas id="ov" width="320" height="240" style="position:absolute;left:0;top:0"></canvas>
+<div id="off" style="position:absolute;left:8px;top:8px">カメラ配信: オフ</div></div>
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
-<p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">表示切替</button></p>
+<p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">表示切替</button><button onclick="post('/stream')">カメラ配信 ON/OFF</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
 function ask(i){post('/ask',new URLSearchParams({i:i}));}
 function askText(){const q=document.getElementById('q').value.trim();if(q)post('/ask',new URLSearchParams({q:q}));}
+let streaming=false,looping=false,box=null,n=0;
+function drawBox(){const c=document.getElementById('ov').getContext('2d');c.clearRect(0,0,320,240);
+if(streaming&&box&&box.age<600){c.strokeStyle='#0f0';c.lineWidth=2;c.strokeRect(box.x,box.y,box.s,box.s);}}
+function loop(){const im=document.getElementById('cam');
+if(!streaming){looping=false;im.style.display='none';document.getElementById('off').style.display='block';drawBox();return;}
+looping=true;im.style.display='block';document.getElementById('off').style.display='none';
+im.onload=()=>{drawBox();setTimeout(loop,250)};im.onerror=()=>setTimeout(loop,1000);
+im.src='/snap?t='+encodeURIComponent(t)+'&n='+(n++);}
 async function poll(){try{const r=await fetch('/status?t='+encodeURIComponent(t));const j=await r.json();
-document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');}catch(e){}}
+document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');
+streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}}
 setInterval(poll,1000);poll();
 </script></html>)HTML";
 
@@ -229,6 +245,10 @@ static void setupWeb() {
     j["ok"] = acceptedN;
     j["rejected"] = rejectedN;
     j["rssi"] = WiFi.RSSI();
+    j["stream"] = streamOn;
+    JsonObject b = j["box"].to<JsonObject>();
+    b["x"] = boxX; b["y"] = boxY; b["s"] = boxS;
+    b["age"] = boxMs ? (long)(millis() - boxMs) : 999999L;
     String body; serializeJson(j, body);
     web.send(200, "application/json; charset=utf-8", body);
   });
@@ -254,6 +274,29 @@ static void setupWeb() {
     const bool ok = core.cancel(millis());
     logEvent(ok ? "cancel_ok" : "cancel_ignored", millis(), 1);
     web.send(200, "text/plain", ok ? "cancelled" : "nothing to cancel");
+  });
+  web.on("/stream", HTTP_POST, [] {
+    if (!authorized()) return;
+    streamOn = !streamOn;
+    logEvent(streamOn ? "stream_on" : "stream_off", millis());
+    web.send(200, "text/plain", streamOn ? "on" : "off");
+  });
+  // One JPEG of the current camera frame. Taken inside loop() context via handleClient(), so
+  // it does not race the detector; the frame is encoded, sent and never stored.
+  web.on("/snap", HTTP_GET, [] {
+    if (!authorized()) return;
+    if (!streamOn) { web.send(409, "text/plain", "stream off"); return; }
+    if (!cameraOk || !CoreS3.Camera.get()) { web.send(503, "text/plain", "no frame"); return; }
+    uint8_t* jpg = nullptr;
+    size_t len = 0;
+    const bool ok = frame2jpg(CoreS3.Camera.fb, 60, &jpg, &len);
+    CoreS3.Camera.free();
+    if (!ok || !jpg) { web.send(500, "text/plain", "encode failed"); return; }
+    web.sendHeader("Cache-Control", "no-store");
+    web.setContentLength(len);
+    web.send(200, "image/jpeg", "");
+    web.client().write(jpg, len);
+    free(jpg);
   });
   web.on("/view", HTTP_POST, [] {
     if (!authorized()) return;
@@ -325,7 +368,7 @@ static void drawOverlay(const stackchan::Output& out) {
   d.fillCircle(11, 11, 8, faceColor(out.face));
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.setCursor(26, 3);
-  d.printf("%s %s%s", stateJa(out.state), out.track_head ? "顔追従" : "顔なし", wifiOk ? "" : " 圏外");
+  d.printf("%s %s%s%s", stateJa(out.state), out.track_head ? "顔追従" : "顔なし", wifiOk ? "" : " 圏外", streamOn ? " 配信中" : "");
   d.fillRect(d.width() - kCancelW, 0, kCancelW, 22, 0x8000);
   d.setCursor(d.width() - kCancelW + 6, 3);
   d.print("中止");
@@ -424,6 +467,7 @@ void loop() {
       x = rcsq[4 * best + 1] / kW * 2.0F - 1.0F;
       ++faceFrames;
       const float row = rcsq[4 * best], col = rcsq[4 * best + 1], s = rcsq[4 * best + 2];
+      boxX = (int)((col - s / 2) * 2); boxY = (int)((row - s / 2) * 2); boxS = (int)s * 2; boxMs = millis();
       if (debugView) canvas.drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
     }
     ++frames;

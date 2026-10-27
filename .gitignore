@@ -17,3 +17,6 @@ experiments/raw/
 host-tests
 *.exe
 *.o
+
+# Generated speech clips (system-voice output; licence not cleared for redistribution)
+firmware/answer_demo/voice_clips.h
