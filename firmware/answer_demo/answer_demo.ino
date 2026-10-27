@@ -11,6 +11,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <M5StackChan.h>
 #include <M5CoreS3.h>
@@ -155,15 +157,110 @@ static void toGray(const uint16_t* src, int srcW) {          // camera RGB565 ne
     }
 }
 
-static void startQuestion(int i, uint32_t now) {
+static bool startPrompt(const char* prompt, int tag, uint32_t now) {
   const uint64_t id = core.start(now);
-  if (id == 0) return;
+  if (id == 0) return false;
   activeId = id;
   answer[0] = 0;
+  status[0] = 0;
   Req r = {id, {0}};
-  strncpy(r.prompt, kQuestions[i].prompt, sizeof(r.prompt) - 1);
+  strncpy(r.prompt, prompt, sizeof(r.prompt) - 1);
   xQueueSend(reqQ, &r, 0);
-  logEvent("start", now, (long)id, i);
+  logEvent("start", now, (long)id, tag);            // the prompt text itself is never logged
+  return true;
+}
+static void startQuestion(int i, uint32_t now) { startPrompt(kQuestions[i].prompt, i, now); }
+
+// ---- remote control over the LAN (plain HTTP + access token) ------------------------
+// Handlers run inside web.handleClient(), which loop() calls, so the core keeps a single
+// owner. Control endpoints need ?t=<WEB_TOKEN>. There is no TLS: use a trusted LAN only.
+static WebServer web(80);
+static uint32_t lastWebAskMs = 0;
+static const char kPage[] PROGMEM = R"HTML(<!doctype html><html lang="ja"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Stack-chan</title>
+<style>body{font-family:sans-serif;max-width:30em;margin:1em auto;padding:0 1em}
+button{font-size:1.1em;padding:.6em 1em;margin:.2em}input{width:100%;font-size:1.1em;padding:.5em;box-sizing:border-box}
+#st{background:#eee;padding:.6em;border-radius:6px;white-space:pre-wrap}</style>
+<h2>Stack-chan</h2><div id="st">...</div>
+<p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
+<p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
+<p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button></p>
+<script>
+const t=new URLSearchParams(location.search).get('t')||'';
+async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
+function ask(i){post('/ask',new URLSearchParams({i:i}));}
+function askText(){const q=document.getElementById('q').value.trim();if(q)post('/ask',new URLSearchParams({q:q}));}
+async function poll(){try{const r=await fetch('/status?t='+encodeURIComponent(t));const j=await r.json();
+document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');}catch(e){}}
+setInterval(poll,1000);poll();
+</script></html>)HTML";
+
+static bool validPrompt(const String& s) {
+  if (s.length() < 1 || s.length() > 120) return false;
+  for (size_t i = 0; i < s.length(); ++i) if ((uint8_t)s[i] < 0x20) return false;
+  return true;
+}
+static bool authorized() {
+  if (!strlen(WEB_TOKEN) || web.arg("t") != WEB_TOKEN) { web.send(403, "text/plain", "forbidden"); return false; }
+  return true;
+}
+static const char* stateEn(State s) {
+  switch (s) {
+    case State::idle: return "idle";
+    case State::waiting: return "waiting";
+    case State::answering: return "answering";
+    case State::cancelled: return "cancelled";
+    case State::error: return "error";
+  }
+  return "";
+}
+static void setupWeb() {
+  web.on("/", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", kPage); });
+  web.on("/status", HTTP_GET, [] {
+    if (!authorized()) return;
+    const auto o = core.output(millis());
+    JsonDocument j;
+    j["state"] = stateEn(o.state);
+    j["track"] = o.track_head;
+    j["x"] = o.normalized_x;
+    j["answer"] = answer;
+    j["status"] = status;
+    j["ok"] = acceptedN;
+    j["rejected"] = rejectedN;
+    j["rssi"] = WiFi.RSSI();
+    String body; serializeJson(j, body);
+    web.send(200, "application/json; charset=utf-8", body);
+  });
+  web.on("/ask", HTTP_POST, [] {
+    if (!authorized()) return;
+    const uint32_t now = millis();
+    if (now - lastWebAskMs < 2000) { web.send(429, "text/plain", "slow down"); return; }
+    bool ok = false;
+    if (web.hasArg("q")) {
+      const String q = web.arg("q");
+      if (!validPrompt(q)) { web.send(400, "text/plain", "bad prompt"); return; }
+      ok = startPrompt(q.c_str(), 9, now);
+    } else {
+      const int i = web.arg("i").toInt();
+      if (i < 0 || i > 2) { web.send(400, "text/plain", "bad index"); return; }
+      ok = startPrompt(kQuestions[i].prompt, i, now);
+    }
+    if (ok) lastWebAskMs = now;
+    web.send(ok ? 200 : 500, "text/plain", ok ? "started" : "failed");
+  });
+  web.on("/cancel", HTTP_POST, [] {
+    if (!authorized()) return;
+    const bool ok = core.cancel(millis());
+    logEvent(ok ? "cancel_ok" : "cancel_ignored", millis(), 1);
+    web.send(200, "text/plain", ok ? "cancelled" : "nothing to cancel");
+  });
+  web.on("/touch", HTTP_POST, [] {
+    if (!authorized()) return;
+    core.touch(millis());
+    logEvent("touch", millis(), 1);
+    web.send(200, "text/plain", "ok");
+  });
+  web.begin();
 }
 
 static void drawOverlay(const stackchan::Output& out) {
@@ -196,6 +293,7 @@ static void drawOverlay(const stackchan::Output& out) {
 void setup() {
   M5StackChan.begin();
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);   // never block the control loop on log output when nobody reads the USB port
   auto& d = M5StackChan.Display();
   d.setFont(&fonts::lgfxJapanGothic_16);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -221,14 +319,33 @@ void setup() {
   }
   Serial.printf("setup wifi=%d key_set=%d free_heap=%u free_psram=%u\n", (int)wifiOk,
                 (int)(strlen(SARASHINA_API_KEY) > 0), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  if (wifiOk) {
+    MDNS.begin("stackchan");
+    MDNS.addService("http", "tcp", 80);
+    setupWeb();
+    d.fillScreen(TFT_BLACK);
+    d.setCursor(0, 0);
+    d.println("リモート操作(同じWi-Fi内)");
+    d.printf("http://%s/\n", WiFi.localIP().toString().c_str());
+    d.printf("http://stackchan.local/\n");
+    d.printf("トークン: %s\n", WEB_TOKEN);
+    Serial.printf("web http://%s/?t=%s\n", WiFi.localIP().toString().c_str(), WEB_TOKEN);
+    delay(10000);
+  }
   cameraOk = CoreS3.Camera.begin();
   Serial.printf("camera %s\n", cameraOk ? "OK" : "FAIL");
   if (!wifiOk) snprintf(status, sizeof(status), "ネットワークなし");
 }
 
+static uint32_t tLoopMax = 0, tWebMax = 0, tCamMax = 0, tServoMax = 0, tDrawMax = 0;   // per-window worst case, ms
+static inline void trackMax(uint32_t& m, uint32_t t0) { const uint32_t d = millis() - t0; if (d > m) m = d; }
+
 void loop() {
+  const uint32_t loopStart = millis();
   M5StackChan.update();
+  if (wifiOk) { const uint32_t t0 = millis(); web.handleClient(); trackMax(tWebMax, t0); }
   uint32_t now = millis();
+  const uint32_t camStart = now;
 
   // Camera -> display -> detector. Capture time is taken when the driver returns the frame.
   bool present = false;
@@ -270,6 +387,8 @@ void loop() {
         yawTarget = constrain(yawTarget + kYawSign * (int)(smoothX * kYawGain), -kYawMax, kYawMax);
     }
   }
+
+  trackMax(tCamMax, camStart);
 
   // Touch: bottom buttons start a question, top-right cancels, anything else is feedback.
   auto t = M5.Touch.getDetail();
@@ -323,16 +442,21 @@ void loop() {
     }
   }
 
+  const uint32_t drawStart = millis();
   drawOverlay(out);
   canvas.pushSprite(0, 0);
+  trackMax(tDrawMax, drawStart);
+  trackMax(tLoopMax, loopStart);
 
   if (now - lastFaceLogMs >= 5000) {
-    Serial.printf("device_monotonic_ms=%lu fps=%.1f face_frames=%lu/%lu track_ticks=%lu servo_cmds=%lu maxq=%.1f x=%.2f ok=%lu rej=%lu free_heap=%u\n",
+    Serial.printf("device_monotonic_ms=%lu fps=%.1f face_frames=%lu/%lu track_ticks=%lu servo_cmds=%lu maxq=%.1f x=%.2f ok=%lu rej=%lu free_heap=%u max_ms loop=%lu web=%lu cam=%lu draw=%lu\n",
                   (unsigned long)now, frames * 1000.0F / (now - lastFaceLogMs), (unsigned long)faceFrames,
                   (unsigned long)frames, (unsigned long)trackFrames, (unsigned long)servoCmds, windowMaxQ, lastX,
-                  (unsigned long)acceptedN, (unsigned long)rejectedN, (unsigned)ESP.getFreeHeap());
+                  (unsigned long)acceptedN, (unsigned long)rejectedN, (unsigned)ESP.getFreeHeap(),
+                  (unsigned long)tLoopMax, (unsigned long)tWebMax, (unsigned long)tCamMax, (unsigned long)tDrawMax);
     frames = faceFrames = trackFrames = servoCmds = 0;
     windowMaxQ = 0;
+    tLoopMax = tWebMax = tCamMax = tDrawMax = 0;
     lastFaceLogMs = now;
   }
 }
