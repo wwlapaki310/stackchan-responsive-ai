@@ -25,7 +25,8 @@
 - firmware/core_synthetic: interaction.hppをloop()の単一タスクに接続。入力は合成のみ（カメラ・通信なし）。ビルド525,663B(16%)、RAM28,588B(8%)、書き込みはハッシュ検証済み。画面の左/中/右タップ=質問開始/キャンセル/タッチ反応、最初のタップで合成顔(正弦波)と首追従(±15°)を有効化。ビルドには`--build-property "compiler.cpp.extra_flags=-I<repo>/include"`が必要。**動作は未確認。**
 - firmware/camera_preview: M5CoreS3 1.0.1の`CoreS3.Camera`(esp32-camera)でフレーム取得し画面表示。ビルド591,027B(18%)、RAM39,788B(12%)、書き込みはハッシュ検証済み。シリアルログ(DTR有効で取得): 初期化OK、320x240 RGB565(len=153600)、画面表示込みで約17〜20fps、空きヒープ約279KB、PSRAM約8.07MB。画面のプレビューは未目視確認。顔検出なし。首は動かさない。1回のログのみで、長時間・条件別の計測ではない。
 - 注意: シリアルは`SerialPort`で`DtrEnable=true`にしないと出力が出ない。ログの"first frame"行は5秒窓ごとに再表示される軽微なバグ(frames==0判定)。M5CoreS3の依存の一部(M5-FPC1020A)がネットワーク断で入らなかったがビルドは通った。
-- 顔検出: Arduinoコア3.3.11の同梱ライブラリにesp-dlなし。検出器の候補とライセンスは未決定。
+- 顔検出: Arduinoコア3.3.11の同梱ライブラリにesp-dlなし（esp-dlはESP-IDF向け）。pico（MIT、nenadmarkus/pico、コミット7d550c78b2c31a4e1dfc5bcdfe9da013297b5cc8）のrnt/picornt.cと学習済みfacefinderカスケードをfirmware/libraries/PicoRnt/に取り込み（LICENSE、SOURCE.txt同梱）。カスケードの学習データの由来と、picoの顔検出としての精度はここでは未検証。
+- firmware/face_detect: 320x240 RGB565を160x120グレーへ2倍間引きしpicoで検出。首は動かさない。ビルド831,855B(26%)、RAM59,004B(18%)、書き込みはハッシュ検証済み。ビルドに`--libraries firmware\libraries`が必要。シリアル(5秒窓、4窓): 約17fps、検出処理の平均約12.9〜13.5ms/フレーム、最大約14.4〜18.5ms、顔検出0/85〜87フレーム。**顔が映っていたかは不明なため、検出の成否は未確認。** RGB565のバイト順の仮定（ネイティブ）が正しいかも未確認。検出時のx符号（カメラの左右とyawの向き）は未校正。
 - サーボ（公式資料）: SCS0009×2、UART1 GPIO6/7、1Mbps半二重。電源はPY32 IOエキスパンダ経由。BSP APIの角度は10=1°、yaw -1280〜1280、pitch 0〜900。M5はpitchを5〜85°に収めるよう勧める。
 
 ## PCの分担
