@@ -36,7 +36,10 @@
 - クラウドAPI（公式 https://docs.sarashina.ai/ で確認、2026-10-27）: `POST https://api.sarashina.ai/v1/chat/completions`、`Authorization: Bearer`、環境変数名`SARASHINA_API_KEY`、モデルsarashina3-mini/nano/guard。許可パラメータ外は400。`max_completion_tokens`は1〜8000。RPM: mini 6、nano 60。429は`Retry-After`。PCからの合成質問1件でnano、HTTP200、約1.45秒（PC→クラウドの値で、本体の値ではない）。サービスの利用条件・データ取り扱いは未確認。無償ベータとする二次情報あり。
 - TLS: ルートCAはAmazon Root CA 1（SHA-1 8DA7F965EC5EFC37910F1C6E59FDC1CC6A6EDE16、amazontrust.comから取得し指紋照合）。チェーン: api.sarashina.ai → Amazon RSA 2048 M04 → Amazon Root CA 1（2026-10-27観測、リーフ期限2027-04-10）。firmware/answer_demo/root_ca.hに固定。ルートの更新・ローテーションで失効しうる。
 - 秘密情報: `tools/gen_secrets.ps1`が環境変数SARASHINA_API_KEY、STACKCHAN_WIFI_SSID、STACKCHAN_WIFI_PASSからgit管理外のfirmware/answer_demo/secrets.hを生成。コミット前に`git grep hki_v1`で漏えいなしを確認済み。キーは会話に貼られたため提出後に再発行する。
-- firmware/answer_demo: 質問選択（下部3ボタン）→HTTPSでAPI要求（別タスク）→顔追従・タッチ表情が継続→検証して表示。中止は右上。ビルドには`--libraries firmware\libraries`と`-I<repo>/include`が必要。ビルド1,288,843B(40%)、RAM66,972B(20%)、書き込みはハッシュ検証済み。**Wi-Fi未設定のオフライン状態でのみ起動確認**（シリアル: wifi=0 key_set=1、カメラOK、約12.6fps、空きヒープ約234KB）。API通信、首追従の向き(kYawSign)、キャンセルと遅着拒否の実機動作は未確認。
+- firmware/answer_demo: 質問選択（下部3ボタン）→HTTPSでAPI要求（別タスク）→顔追従・タッチ表情が継続→検証して表示。中止は右上。ビルドには`--libraries firmware\libraries`と`-I<repo>/include`が必要。ビルド1,288,843B(40%)、RAM66,972B(20%)、書き込みはハッシュ検証済み。Wi-Fi設定後の再ビルドは1,691,287B(53%)、RAM83,332B(25%)。
+  - オフライン時（2026-10-27）: wifi=0 key_set=1、カメラOK、約12.6fps、空きヒープ約234KB。
+  - Wi-Fi接続後（2026-10-27、シリアルログ）: wifi=1（NTP同期後）。ユーザー操作とみられる質問開始（start、質問番号1）から、本体測定でHTTPS要求→HTTP 200、605ms、reply_accepted（回答78バイト）まで一巡を確認。本体→クラウドは証明書検証付きHTTPS（Amazon Root CA 1固定）。この1件のみで、反復・失敗率・長時間は未計測。空きヒープは通信時約157KB。画面に回答が表示されたかの目視は未確認。
+  - 未確認: キャンセルと遅着応答の拒否、通信失敗・タイムアウトからの回復、再起動後の再現、首追従の向き(kYawSign)、待機中の顔追従とタッチ表情の同時動作の目視。
 - サーボ（公式資料）: SCS0009×2、UART1 GPIO6/7、1Mbps半二重。電源はPY32 IOエキスパンダ経由。BSP APIの角度は10=1°、yaw -1280〜1280、pitch 0〜900。M5はpitchを5〜85°に収めるよう勧める。
 
 ## PCの分担
