@@ -32,9 +32,11 @@ static const char* kModel = "sarashina3-nano";            // 60 RPM; mini is 6 R
 static constexpr uint32_t kHttpTimeoutMs = 12000;          // < core timeout (15000)
 static constexpr size_t kMaxAnswerBytes = 180;
 static constexpr uint32_t kAnswerShowMs = 8000;
-static constexpr int kYawMax = 150;                        // 10 = 1 deg -> +-15 deg
-static constexpr int kYawSign = 1;                         // flip if the head turns away from the face
-static constexpr int kServoSpeed = 300;
+static constexpr int kYawMax = 450;                        // 10 = 1 deg -> +-45 deg
+static constexpr int kYawSign = 1;                         // verified 2026-10-27: face moves toward the centre
+static constexpr int kServoSpeed = 600;
+static constexpr float kYawGain = 60.0F;                   // yaw units added per detection at |x| = 1
+static constexpr float kDeadband = 0.08F;                  // |x| below this is "centred"
 static constexpr uint32_t kServoIntervalMs = 100;
 static constexpr int kW = 160, kH = 120;                   // detector input
 static constexpr float kQualityMin = 5.0F;
@@ -112,7 +114,7 @@ static char status[48] = "";
 static uint32_t answerStartMs = 0, lastServoMs = 0, lastFaceLogMs = 0, faceFrames = 0, frames = 0;
 static uint32_t acceptedN = 0, rejectedN = 0;
 static float lastX = 0, bestQ = 0, windowMaxQ = 0;
-static int lastYaw = 0;
+static int lastYaw = 0, yawTarget = 0;
 static bool prevTrack = false, smoothValid = false;
 static float smoothX = 0;
 static uint32_t lastTrackMs = 0;
@@ -261,6 +263,11 @@ void loop() {
       smoothValid = true;
       core.observe(smoothX, true, captured, now);
       lastX = smoothX;
+      // Integral control: turn a little toward the face on every new detection, so the
+      // face ends up centred. Applying it per detection (not per servo tick) avoids
+      // integrating one stale observation several times.
+      if (fabsf(smoothX) > kDeadband)
+        yawTarget = constrain(yawTarget + kYawSign * (int)(smoothX * kYawGain), -kYawMax, kYawMax);
     }
   }
 
@@ -306,10 +313,9 @@ void loop() {
       if (!out.track_head) smoothValid = false;
     }
     if (out.track_head) { ++trackFrames; lastTrackMs = now; }
-    int yaw = lastYaw;                                     // hold by default
-    if (out.track_head) yaw = kYawSign * (int)(out.normalized_x * kYawMax);
-    else if (now - lastTrackMs > kHoldMs) yaw = 0;
-    if (abs(yaw - lastYaw) >= 10) {
+    if (!out.track_head && now - lastTrackMs > kHoldMs) yawTarget = 0;   // otherwise hold
+    const int yaw = yawTarget;
+    if (abs(yaw - lastYaw) >= 5) {
       M5StackChan.Motion.moveX(yaw, kServoSpeed);
       logEvent("servo_yaw", now, yaw, (long)(out.normalized_x * 100));
       lastYaw = yaw;
