@@ -110,6 +110,7 @@ static stackchan::Interaction core;
 static M5Canvas canvas(&M5.Display);   // off-screen frame: compose camera + overlay, then push once
 static uint8_t gray[kW * kH];
 static bool cameraOk = false, wifiOk = false;
+static bool debugView = false;   // false: Stack-chan's face; true: camera preview with detection box
 static uint64_t activeId = 0;
 static char answer[kMaxAnswerBytes + 1] = "";
 static char status[48] = "";
@@ -184,7 +185,7 @@ button{font-size:1.1em;padding:.6em 1em;margin:.2em}input{width:100%;font-size:1
 <h2>Stack-chan</h2><div id="st">...</div>
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
-<p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button></p>
+<p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">表示切替</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
@@ -254,6 +255,11 @@ static void setupWeb() {
     logEvent(ok ? "cancel_ok" : "cancel_ignored", millis(), 1);
     web.send(200, "text/plain", ok ? "cancelled" : "nothing to cancel");
   });
+  web.on("/view", HTTP_POST, [] {
+    if (!authorized()) return;
+    debugView = !debugView;
+    web.send(200, "text/plain", debugView ? "camera" : "face");
+  });
   web.on("/touch", HTTP_POST, [] {
     if (!authorized()) return;
     core.touch(millis());
@@ -261,6 +267,55 @@ static void setupWeb() {
     web.send(200, "text/plain", "ok");
   });
   web.begin();
+}
+
+// Stack-chan's face. The expression comes from the core (out.face); the eyes follow the
+// tracked face (out.normalized_x) and wander slowly when nobody is seen.
+static float gaze = 0;
+static uint32_t nextBlinkMs = 3000, blinkUntilMs = 0;
+static void drawFace(const stackchan::Output& out, uint32_t now) {
+  auto& d = canvas;
+  const int w = d.width(), cx = w / 2, ey = 74, er = 30, my = 132;
+  const int ex[2] = {cx - 66, cx + 66};
+  const float target = out.track_head ? out.normalized_x : 0.25F * sinf(now / 2500.0F);
+  gaze += (target - gaze) * 0.25F;
+  if (now >= nextBlinkMs) { blinkUntilMs = now + 140; nextBlinkMs = now + 2500 + (now * 7) % 2500; }
+  const bool blink = now < blinkUntilMs;
+  int px = (int)(gaze * 13), py = 0;
+  if (out.face == Face::thinking) { px = 11; py = -12; }
+  for (int e = 0; e < 2; ++e) {
+    const int x = ex[e];
+    switch (out.face) {
+      case Face::happy: d.fillArc(x, ey + 12, er - 9, er, 200, 340, TFT_WHITE); break;                 // ^ ^
+      case Face::cancelled: d.fillRect(x - er, ey - 3, er * 2, 6, TFT_WHITE); break;
+      case Face::error:
+        for (int o = -1; o <= 1; ++o) {
+          d.drawLine(x - er / 2 + o, ey - er / 2, x + er / 2 + o, ey + er / 2, TFT_RED);
+          d.drawLine(x - er / 2 + o, ey + er / 2, x + er / 2 + o, ey - er / 2, TFT_RED);
+        }
+        break;
+      default:
+        if (blink) d.fillRect(x - er, ey - 3, er * 2, 6, TFT_WHITE);
+        else { d.fillCircle(x, ey, er, TFT_WHITE); d.fillCircle(x + px, ey + py, er / 2, TFT_BLACK); }
+    }
+  }
+  switch (out.face) {
+    case Face::happy:
+      d.fillArc(cx, my - 16, 18, 30, 20, 160, TFT_WHITE);
+      d.fillCircle(ex[0] - 14, ey + 44, 9, 0xF810);
+      d.fillCircle(ex[1] + 14, ey + 44, 9, 0xF810);
+      break;
+    case Face::answer:                                                   // talking mouth
+      d.fillEllipse(cx, my + 2, 20, 6 + (int)(5 + 5 * sinf(now / 110.0F)), TFT_WHITE);
+      break;
+    case Face::thinking:
+      d.fillRect(cx - 14, my, 28, 5, TFT_WHITE);
+      for (int i = 0; i < 3; ++i) if ((int)(now / 350) % 4 > i) d.fillCircle(cx + 64 + i * 16, 38, 5, TFT_CYAN);
+      break;
+    case Face::cancelled: d.fillRect(cx - 16, my, 32, 5, TFT_ORANGE); break;
+    case Face::error: d.fillArc(cx, my + 26, 18, 28, 200, 340, TFT_RED); break;
+    default: d.fillArc(cx, my - 14, 16, 22, 30, 150, TFT_WHITE);
+  }
 }
 
 static void drawOverlay(const stackchan::Output& out) {
@@ -353,7 +408,7 @@ void loop() {
   if (cameraOk && CoreS3.Camera.get()) {
     const uint32_t captured = millis();
     auto* fb = CoreS3.Camera.fb;
-    canvas.pushImage(0, 0, fb->width, fb->height, (uint16_t*)fb->buf);
+    if (debugView) canvas.pushImage(0, 0, fb->width, fb->height, (uint16_t*)fb->buf);
     toGray((const uint16_t*)fb->buf, fb->width);
     CoreS3.Camera.free();
     float rcsq[4 * 16];
@@ -369,7 +424,7 @@ void loop() {
       x = rcsq[4 * best + 1] / kW * 2.0F - 1.0F;
       ++faceFrames;
       const float row = rcsq[4 * best], col = rcsq[4 * best + 1], s = rcsq[4 * best + 2];
-      canvas.drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
+      if (debugView) canvas.drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
     }
     ++frames;
     now = millis();
@@ -443,6 +498,7 @@ void loop() {
   }
 
   const uint32_t drawStart = millis();
+  if (!debugView) { canvas.fillScreen(TFT_BLACK); drawFace(out, now); }
   drawOverlay(out);
   canvas.pushSprite(0, 0);
   trackMax(tDrawMax, drawStart);
