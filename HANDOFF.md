@@ -33,6 +33,10 @@
   - 修正後の速度: 約15.6〜16.4fps、検出平均約15.8〜16.8ms/フレーム。
   - 検出時のx符号（カメラの左右とyawの向き）は未校正。
   - 取り出したPNGは人物の顔が写るためコミットしない（スクラッチパッドのみ）。
+- クラウドAPI（公式 https://docs.sarashina.ai/ で確認、2026-10-27）: `POST https://api.sarashina.ai/v1/chat/completions`、`Authorization: Bearer`、環境変数名`SARASHINA_API_KEY`、モデルsarashina3-mini/nano/guard。許可パラメータ外は400。`max_completion_tokens`は1〜8000。RPM: mini 6、nano 60。429は`Retry-After`。PCからの合成質問1件でnano、HTTP200、約1.45秒（PC→クラウドの値で、本体の値ではない）。サービスの利用条件・データ取り扱いは未確認。無償ベータとする二次情報あり。
+- TLS: ルートCAはAmazon Root CA 1（SHA-1 8DA7F965EC5EFC37910F1C6E59FDC1CC6A6EDE16、amazontrust.comから取得し指紋照合）。チェーン: api.sarashina.ai → Amazon RSA 2048 M04 → Amazon Root CA 1（2026-10-27観測、リーフ期限2027-04-10）。firmware/answer_demo/root_ca.hに固定。ルートの更新・ローテーションで失効しうる。
+- 秘密情報: `tools/gen_secrets.ps1`が環境変数SARASHINA_API_KEY、STACKCHAN_WIFI_SSID、STACKCHAN_WIFI_PASSからgit管理外のfirmware/answer_demo/secrets.hを生成。コミット前に`git grep hki_v1`で漏えいなしを確認済み。キーは会話に貼られたため提出後に再発行する。
+- firmware/answer_demo: 質問選択（下部3ボタン）→HTTPSでAPI要求（別タスク）→顔追従・タッチ表情が継続→検証して表示。中止は右上。ビルドには`--libraries firmware\libraries`と`-I<repo>/include`が必要。ビルド1,288,843B(40%)、RAM66,972B(20%)、書き込みはハッシュ検証済み。**Wi-Fi未設定のオフライン状態でのみ起動確認**（シリアル: wifi=0 key_set=1、カメラOK、約12.6fps、空きヒープ約234KB）。API通信、首追従の向き(kYawSign)、キャンセルと遅着拒否の実機動作は未確認。
 - サーボ（公式資料）: SCS0009×2、UART1 GPIO6/7、1Mbps半二重。電源はPY32 IOエキスパンダ経由。BSP APIの角度は10=1°、yaw -1280〜1280、pitch 0〜900。M5はpitchを5〜85°に収めるよう勧める。
 
 ## PCの分担
