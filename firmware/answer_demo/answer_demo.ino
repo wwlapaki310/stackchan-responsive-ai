@@ -38,6 +38,7 @@ static constexpr int kServoSpeed = 300;
 static constexpr uint32_t kServoIntervalMs = 100;
 static constexpr int kW = 160, kH = 120;                   // detector input
 static constexpr float kQualityMin = 5.0F;
+static constexpr int kCancelW = 48;                        // top-right cancel button width in px
 
 struct Question { const char* label; const char* prompt; };
 static const Question kQuestions[3] = {
@@ -102,6 +103,7 @@ static void apiTask(void*) {
 
 // ---- state owned by loop() --------------------------------------------------------
 static stackchan::Interaction core;
+static M5Canvas canvas(&M5.Display);   // off-screen frame: compose camera + overlay, then push once
 static uint8_t gray[kW * kH];
 static bool cameraOk = false, wifiOk = false;
 static uint64_t activeId = 0;
@@ -109,8 +111,13 @@ static char answer[kMaxAnswerBytes + 1] = "";
 static char status[48] = "";
 static uint32_t answerStartMs = 0, lastServoMs = 0, lastFaceLogMs = 0, faceFrames = 0, frames = 0;
 static uint32_t acceptedN = 0, rejectedN = 0;
-static float lastX = 0;
+static float lastX = 0, bestQ = 0, windowMaxQ = 0;
 static int lastYaw = 0;
+static bool prevTrack = false, smoothValid = false;
+static float smoothX = 0;
+static uint32_t lastTrackMs = 0;
+static constexpr uint32_t kHoldMs = 3000;                  // keep the head still this long after the face is lost
+static uint32_t trackFrames = 0, servoCmds = 0;
 
 static const char* stateJa(State s) {
   switch (s) {
@@ -158,15 +165,15 @@ static void startQuestion(int i, uint32_t now) {
 }
 
 static void drawOverlay(const stackchan::Output& out) {
-  auto& d = M5StackChan.Display();
+  auto& d = canvas;
   d.setFont(&fonts::lgfxJapanGothic_16);
   d.fillRect(0, 0, d.width(), 22, TFT_BLACK);
   d.fillCircle(11, 11, 8, faceColor(out.face));
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.setCursor(26, 3);
   d.printf("%s %s%s", stateJa(out.state), out.track_head ? "顔追従" : "顔なし", wifiOk ? "" : " 圏外");
-  d.fillRect(d.width() - 36, 0, 36, 22, 0x8000);
-  d.setCursor(d.width() - 28, 3);
+  d.fillRect(d.width() - kCancelW, 0, kCancelW, 22, 0x8000);
+  d.setCursor(d.width() - kCancelW + 6, 3);
   d.print("中止");
   if (answer[0] || status[0]) {
     d.fillRect(0, 150, d.width(), 44, TFT_BLACK);
@@ -191,6 +198,9 @@ void setup() {
   d.setFont(&fonts::lgfxJapanGothic_16);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.fillScreen(TFT_BLACK);
+  canvas.setPsram(true);
+  canvas.createSprite(d.width(), d.height());
+  canvas.fillScreen(TFT_BLACK);
   reqQ = xQueueCreate(1, sizeof(Req));
   resQ = xQueueCreate(2, sizeof(Res));
   xTaskCreatePinnedToCore(apiTask, "api", 16384, nullptr, 1, nullptr, 0);
@@ -224,7 +234,7 @@ void loop() {
   if (cameraOk && CoreS3.Camera.get()) {
     const uint32_t captured = millis();
     auto* fb = CoreS3.Camera.fb;
-    M5StackChan.Display().pushImage(0, 0, fb->width, fb->height, (uint16_t*)fb->buf);
+    canvas.pushImage(0, 0, fb->width, fb->height, (uint16_t*)fb->buf);
     toGray((const uint16_t*)fb->buf, fb->width);
     CoreS3.Camera.free();
     float rcsq[4 * 16];
@@ -235,15 +245,23 @@ void loop() {
       if (rcsq[4 * i + 3] >= kQualityMin && (best < 0 || rcsq[4 * i + 3] > rcsq[4 * best + 3])) best = i;
     if (best >= 0) {
       present = true;
+      bestQ = rcsq[4 * best + 3];
+      if (bestQ > windowMaxQ) windowMaxQ = bestQ;
       x = rcsq[4 * best + 1] / kW * 2.0F - 1.0F;
       ++faceFrames;
       const float row = rcsq[4 * best], col = rcsq[4 * best + 1], s = rcsq[4 * best + 2];
-      M5StackChan.Display().drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
+      canvas.drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
     }
     ++frames;
     now = millis();
-    core.observe(x, present, captured, now);
-    lastX = x;
+    // Only detections are reported. A missed frame is not evidence that the face left: the
+    // core's observation TTL decides when tracking stops.
+    if (present) {
+      smoothX = smoothValid ? 0.5F * smoothX + 0.5F * x : x;
+      smoothValid = true;
+      core.observe(smoothX, true, captured, now);
+      lastX = smoothX;
+    }
   }
 
   // Touch: bottom buttons start a question, top-right cancels, anything else is feedback.
@@ -251,7 +269,7 @@ void loop() {
   if (t.wasPressed()) {
     auto& d = M5StackChan.Display();
     if (t.y >= 200) startQuestion(constrain(t.x * 3 / d.width(), 0, 2), now);
-    else if (t.y < 22 && t.x >= d.width() - 36) { logEvent(core.cancel(now) ? "cancel_ok" : "cancel_ignored", now); }
+    else if (t.y < 22 && t.x >= d.width() - kCancelW) { logEvent(core.cancel(now) ? "cancel_ok" : "cancel_ignored", now); }
     else { core.touch(now); logEvent("touch", now); }
   }
 
@@ -282,18 +300,33 @@ void loop() {
   // Head: follow a fresh face observation; otherwise drift back to centre.
   if (now - lastServoMs >= kServoIntervalMs) {
     lastServoMs = now;
-    const int yaw = out.track_head ? kYawSign * (int)(out.normalized_x * kYawMax) : 0;
-    if (abs(yaw - lastYaw) >= 10) { M5StackChan.Motion.moveX(yaw, kServoSpeed); lastYaw = yaw; }
+    if (out.track_head != prevTrack) {
+      logEvent(out.track_head ? "track_on" : "track_off", now, (long)(out.normalized_x * 100), (long)(bestQ * 10));
+      prevTrack = out.track_head;
+      if (!out.track_head) smoothValid = false;
+    }
+    if (out.track_head) { ++trackFrames; lastTrackMs = now; }
+    int yaw = lastYaw;                                     // hold by default
+    if (out.track_head) yaw = kYawSign * (int)(out.normalized_x * kYawMax);
+    else if (now - lastTrackMs > kHoldMs) yaw = 0;
+    if (abs(yaw - lastYaw) >= 10) {
+      M5StackChan.Motion.moveX(yaw, kServoSpeed);
+      logEvent("servo_yaw", now, yaw, (long)(out.normalized_x * 100));
+      lastYaw = yaw;
+      ++servoCmds;
+    }
   }
 
   drawOverlay(out);
+  canvas.pushSprite(0, 0);
 
   if (now - lastFaceLogMs >= 5000) {
-    Serial.printf("device_monotonic_ms=%lu fps=%.1f face_frames=%lu/%lu x=%.2f ok=%lu rej=%lu free_heap=%u\n",
+    Serial.printf("device_monotonic_ms=%lu fps=%.1f face_frames=%lu/%lu track_ticks=%lu servo_cmds=%lu maxq=%.1f x=%.2f ok=%lu rej=%lu free_heap=%u\n",
                   (unsigned long)now, frames * 1000.0F / (now - lastFaceLogMs), (unsigned long)faceFrames,
-                  (unsigned long)frames, lastX, (unsigned long)acceptedN, (unsigned long)rejectedN,
-                  (unsigned)ESP.getFreeHeap());
-    frames = faceFrames = 0;
+                  (unsigned long)frames, (unsigned long)trackFrames, (unsigned long)servoCmds, windowMaxQ, lastX,
+                  (unsigned long)acceptedN, (unsigned long)rejectedN, (unsigned)ESP.getFreeHeap());
+    frames = faceFrames = trackFrames = servoCmds = 0;
+    windowMaxQ = 0;
     lastFaceLogMs = now;
   }
 }
