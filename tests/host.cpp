@@ -1,3 +1,4 @@
+#include "director.hpp"
 #include "interaction.hpp"
 #include <iostream>
 #include <limits>
@@ -46,8 +47,34 @@ int main() {
     require(b.output(124).state == State::waiting, "face loss is not cancellation");
     require(b.fail(valid, 125), "current failure accepted");
     require(!b.reply(valid, 126), "reply after failure rejected");
+
+    // Autonomous behaviour policy (director.hpp)
+    Director d;
+    require(d.step(0, false, State::idle, true) == Act::none, "director starts quiet");
+    require(d.step(9000, true, State::idle, true) == Act::greet, "greet when a face appears after a gap");
+    require(d.step(10000, true, State::idle, true) == Act::none, "no ask before the face is stable");
+    require(d.step(12000, true, State::idle, true) == Act::ask, "ask once the face is stable");
+    require(d.step(12100, true, State::idle, true) == Act::none, "ask is not repeated");
+    require(d.step(13000, true, State::waiting, true) == Act::none, "no filler right after the request starts");
+    require(d.step(14600, true, State::waiting, true) == Act::filler && d.fillers_said() == 1, "first filler");
+    require(d.step(16000, true, State::waiting, true) == Act::none, "fillers are spaced");
+    require(d.step(17600, true, State::waiting, true) == Act::filler && d.fillers_said() == 2, "second filler");
+    require(d.step(30000, true, State::waiting, true) == Act::none, "filler count is capped");
+    require(d.step(31000, true, State::idle, true) == Act::none, "ask cooldown holds");
+    require(d.step(43000, true, State::idle, true) == Act::ask, "ask again after the cooldown");
+    require(d.step(42000, true, State::idle, true) == Act::none, "regressing clock ignored");
+    d.step(44000, false, State::idle, true);
+    require(d.step(46000, true, State::idle, true) == Act::none, "brief loss does not re-greet");
+    require(d.step(100000, false, State::idle, true) == Act::none, "just lost");
+    require(d.step(146000, false, State::idle, true) == Act::lonely, "call out after a long absence");
+    require(d.step(150000, false, State::idle, true) == Act::none, "lonely cooldown");
+    Director off;
+    off.step(0, false, State::idle, false);
+    require(off.step(9000, true, State::idle, false) == Act::none && off.step(20000, true, State::idle, false) == Act::none,
+            "disabled director never acts");
+    require(off.step(30000, true, State::idle, true) == Act::ask, "enabling later acts on current state");
     std::cout << "PASS: cancellation, supersession, timeout, tracking freshness, "
-                 "clock validation and independent display/head policy\n";
+                 "clock validation, independent display/head policy and the autonomous director policy\n";
     std::cout << "HOST POLICY TEST ONLY: no physical latency or MCU validation\n";
     return 0;
   } catch (const std::exception& error) {
