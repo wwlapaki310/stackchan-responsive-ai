@@ -80,8 +80,44 @@ static const char* kSystemPrompt = "あなたは小さな卓上ロボットで�
 
 // ---- speaker ------------------------------------------------------------------------
 static bool muted = false;
+// The CoreS3 microphone and speaker share the audio port and cannot run together: the mic
+// listens while the robot is silent, and is stopped before anything is played.
+static bool micOn = false, micAllowed = true, micFailed = false;
+static uint32_t micStartMs = 0;                            // sounds in the first 700 ms after (re)start are start-up noise
+static constexpr size_t kMicN = 256;                       // 16 ms at 16 kHz
+static int16_t micBuf[2][kMicN];
+static volatile uint32_t micLevel = 0, micWindowMax = 0;   // mean absolute deviation of the last buffer
+static void micReleased(void*, void* data, size_t length) {
+  const int16_t* p = (const int16_t*)data;
+  int32_t sum = 0;
+  for (size_t i = 0; i < length; ++i) sum += p[i];
+  const int32_t mean = sum / (int32_t)length;
+  uint32_t dev = 0;
+  for (size_t i = 0; i < length; ++i) dev += (uint32_t)abs(p[i] - mean);
+  micLevel = dev / length;
+  if (micLevel > micWindowMax) micWindowMax = micLevel;
+  M5.Mic.record((int16_t*)data, length, 16000);            // keep capturing (allowed from this callback)
+}
+static void startMic() {
+  M5.Speaker.end();
+  M5.Mic.setBufferReleaseCallback(nullptr, micReleased);
+  if (M5.Mic.begin()) {
+    micLevel = 0;
+    micWindowMax = 0;
+    for (int i = 0; i < 2; ++i) M5.Mic.record(micBuf[i], kMicN, 16000);
+    micStartMs = millis();
+    micOn = true;
+  } else {
+    micFailed = true;
+  }
+}
+static void useSpeaker() {
+  if (micOn) { M5.Mic.end(); micOn = false; micLevel = 0; }
+  if (!M5.Speaker.isRunning()) M5.Speaker.begin();
+}
 #if VOICE_CLIPS_AVAILABLE
 static void sayClip(int id) {
+  if (!muted) useSpeaker();
   if (!muted) M5.Speaker.playRaw(kVoiceClips[id].data, kVoiceClips[id].samples, VOICE_SAMPLE_RATE, false, 1, -1, false);
 }
 #define SAY(name) sayClip(VOICE_##name)
@@ -219,6 +255,12 @@ static uint32_t happyUntilMs = 0, nextWanderMs = 0, lastTouchVoiceMs = 0;
 static uint32_t pressMs = 0, ttsPlayMs = 0;
 static bool pressing = false, longDone = false, ttsPlaying = false, timeoutSaid = false;
 static unsigned autoIndex = 0;
+static int trackMode = 0;            // 0 face detection (pico), 1 motion (frame difference), 2 face, motion as fallback
+static uint32_t lastMoveMs = 0;      // last servo command: the camera moves with the head
+static uint8_t prevGray[kW * kH];
+static bool prevValid = false;
+static float micFloor = 150;                               // adaptive background level
+static uint32_t lastAudioMs = 0, lastSoundMs = 0, lastListenMs = 0;
 
 static const char* stateJa(State s) {
   switch (s) {
@@ -240,7 +282,13 @@ static uint16_t faceColor(Face f) {
     default: return TFT_WHITE;
   }
 }
+struct Ev { uint32_t ms; const char* name; long a; };      // names are string literals
+static Ev evBuf[32];
+static uint32_t evSeq = 0;
+static uint32_t lastApiMs = 0;
+static float lastFps = 0;
 static void logEvent(const char* ev, uint32_t now, long a = 0, long b = 0) {
+  if (strcmp(ev, "servo_yaw") != 0) { evBuf[evSeq % 32] = {now, ev, a}; ++evSeq; }
   Serial.printf("device_monotonic_ms=%lu event=%s a=%ld b=%ld\n", (unsigned long)now, ev, a, b);
 }
 
@@ -252,6 +300,43 @@ static void toGray(const uint16_t* src, int srcW) {          // camera RGB565 ne
       const int r = (p >> 11) & 31, g = (p >> 5) & 63, b = p & 31;
       gray[y * kW + x] = (uint8_t)((r * 8 * 77 + g * 4 * 150 + b * 8 * 29) >> 8);
     }
+}
+
+// Simple alternative to the face detector: where does the image change most? Frame difference
+// on 4x4-pixel cells; the changed cells' centroid is the target. The camera sits on the head,
+// so frames taken while the head moves are ignored (the whole image shifts). Returns false
+// when nothing is moving, when too much of the image changes (light flicker, head motion), or
+// right after a head move. Always refreshes the reference frame.
+static bool detectMotion(float& x, int& bx, int& by, int& bs, float& quality, uint32_t now) {
+  constexpr int cw = kW / 4, ch = kH / 4;
+  const bool valid = prevValid && now - lastMoveMs > 350;
+  bool found = false;
+  if (valid) {
+    int active = 0;
+    float sx = 0, sy = 0, sxx = 0, syy = 0;
+    for (int cy = 0; cy < ch; ++cy)
+      for (int cx = 0; cx < cw; ++cx) {
+        int changed = 0;
+        for (int j = 0; j < 4; ++j) {
+          const int o = (cy * 4 + j) * kW + cx * 4;
+          for (int i = 0; i < 4; ++i) changed += abs((int)gray[o + i] - (int)prevGray[o + i]) >= 24;
+        }
+        if (changed >= 6) { ++active; sx += cx; sy += cy; sxx += cx * cx; syy += cy * cy; }
+      }
+    if (active >= 4 && active <= cw * ch * 35 / 100) {
+      const float mx = sx / active, my = sy / active;
+      const float vx = max(0.0F, sxx / active - mx * mx), vy = max(0.0F, syy / active - my * my);
+      x = (mx + 0.5F) / cw * 2.0F - 1.0F;
+      bs = (int)constrain(sqrtf(max(vx, vy)) * 3.0F + 2.0F, 3.0F, 30.0F) * 8;   // 320x240 pixels
+      bx = (int)((mx + 0.5F) * 8) - bs / 2;
+      by = (int)((my + 0.5F) * 8) - bs / 2;
+      quality = active / 10.0F;
+      found = true;
+    }
+  }
+  memcpy(prevGray, gray, sizeof(prevGray));
+  prevValid = true;
+  return found;
 }
 
 static bool startPrompt(const char* prompt, int tag, uint32_t now) {
@@ -289,18 +374,22 @@ static WebServer web(80);
 static uint32_t lastWebAskMs = 0;
 static const char kPage[] PROGMEM = R"HTML(<!doctype html><html lang="ja"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Stack-chan</title>
-<style>body{font-family:sans-serif;max-width:30em;margin:1em auto;padding:0 1em}
+<style>body{font-family:sans-serif;max-width:46em;margin:1em auto;padding:0 1em}
 button{font-size:1.05em;padding:.5em .9em;margin:.2em}input{width:100%;font-size:1.1em;padding:.5em;box-sizing:border-box}
-#st{background:#eee;padding:.6em;border-radius:6px;white-space:pre-wrap}.on{background:#cfe8ff}</style>
+#st{background:#eee;padding:.6em;border-radius:6px;white-space:pre-wrap}.on{background:#cfe8ff}
+#nums span{display:inline-block;min-width:9em;margin-right:.6em}canvas{max-width:100%}</style>
 <h2>Stack-chan</h2><div id="st">...</div>
-<div style="position:relative;width:320px;height:240px;margin:.6em 0;background:#222;color:#aaa">
+<div style="display:flex;flex-wrap:wrap;gap:.8em;align-items:flex-start">
+<div style="position:relative;width:320px;height:240px;background:#222;color:#aaa;flex:none">
 <img id="cam" width="320" height="240" style="display:none;position:absolute;left:0;top:0">
 <canvas id="ov" width="320" height="240" style="position:absolute;left:0;top:0"></canvas>
 <div id="off" style="position:absolute;left:8px;top:8px">カメラ配信: オフ</div></div>
+<div id="nums"><span id="n_fps"></span><span id="n_api"></span><span id="n_mic"></span><span id="n_rssi"></span></div></div>
+<canvas id="dash" width="720" height="210" style="background:#fafafa;border:1px solid #ccc;margin:.5em 0"></canvas>
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
 <p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">本体の表示切替</button></p>
-<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button></p>
+<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
@@ -316,12 +405,32 @@ looping=true;im.style.display='block';document.getElementById('off').style.displ
 im.onload=()=>{drawBox();setTimeout(loop,250)};im.onerror=()=>setTimeout(loop,1000);
 im.src='/snap?t='+encodeURIComponent(t)+'&n='+(n++);}
 function mark(id,on){document.getElementById(id).className=on?'on':'';}
+// dashboard: head angle and the request timeline, last WIN ms
+const WIN=40000,samples=[],events=[];let lastSeq=-1,off=0;
+const EV={start:['質問','#1f77b4'],reply_accepted:['回答','#2ca02c'],request_failed:['失敗','#d62728'],track_on:['顔あり','#9467bd'],
+track_off:['顔なし','#999'],touch:['タッチ','#ff7f0e'],sound:['音','#e377c2'],auto_greet:['挨拶','#17becf'],auto_filler:['えーっと','#17becf'],
+cancel_ok:['中止','#555'],auto_lonely:['だれか','#17becf']};
+function draw(){const c=document.getElementById('dash'),g=c.getContext('2d'),W=c.width,H=c.height,L=44,B=60,now=Date.now(),x=ms=>L+(W-L-6)*(1-(now-ms)/WIN);
+g.clearRect(0,0,W,H);const top=8,ph=H-B-top,y=a=>top+ph/2-(a/45)*(ph/2);
+for(let i=1;i<samples.length;i++){if(samples[i-1].w){g.fillStyle='rgba(31,119,180,.14)';g.fillRect(x(samples[i-1].t),top,x(samples[i].t)-x(samples[i-1].t),ph);}}
+g.strokeStyle='#ddd';g.fillStyle='#666';g.font='11px sans-serif';for(const a of[-45,0,45]){g.beginPath();g.moveTo(L,y(a));g.lineTo(W-6,y(a));g.stroke();g.fillText(a+'°',4,y(a)+4);}
+function line(k,col,dash){g.beginPath();g.setLineDash(dash);g.strokeStyle=col;g.lineWidth=2;let f=true;for(const s of samples){if(now-s.t>WIN)continue;const px=x(s.t),py=y(s[k]);if(f){g.moveTo(px,py);f=false}else g.lineTo(px,py);}g.stroke();g.setLineDash([]);}
+line('target','#999',[5,4]);line('yaw','#d62728',[]);
+g.fillStyle='#d62728';g.fillText('首の角度',L+4,top+10);g.fillStyle='#999';g.fillText('目標',L+64,top+10);g.fillStyle='rgba(31,119,180,.5)';g.fillText('■ 回答待ち',L+100,top+10);
+g.strokeStyle='#bbb';g.beginPath();g.moveTo(L,H-B+4);g.lineTo(W-6,H-B+4);g.stroke();
+let k=0;for(const e of events){const d=EV[e.n];if(!d||now-e.t>WIN)continue;const px=x(e.t);g.strokeStyle=d[1];g.beginPath();g.moveTo(px,H-B+4);g.lineTo(px,H-B+10+(k%4)*11);g.stroke();g.fillStyle=d[1];g.fillText(d[0],px+2,H-B+20+(k%4)*11);k++;}
+g.fillStyle='#666';g.fillText('-40秒',L,H-4);g.fillText('現在',W-30,H-4);}
 async function poll(){try{const r=await fetch('/status?t='+encodeURIComponent(t));const j=await r.json();
+const dn=Date.now();off=dn-j.now;samples.push({t:dn,yaw:j.yaw,target:j.target,w:j.state==='waiting'});while(samples.length&&dn-samples[0].t>WIN+2000)samples.shift();
+for(const e of j.ev){if(e.s>lastSeq){lastSeq=e.s;events.push({t:e.ms+off,n:e.n,a:e.a});}}while(events.length&&dn-events[0].t>WIN+2000)events.shift();
 document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');
-mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);
-streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}}
-setInterval(poll,1000);poll();
-</script></html>)HTML";
+document.getElementById('n_fps').textContent='検出 '+j.fps.toFixed(1)+' fps';document.getElementById('n_api').textContent='API '+j.api_ms+' ms';
+document.getElementById('n_mic').textContent='音 '+j.mic+(j.mic_on?'':' (停止中)');document.getElementById('n_rssi').textContent='Wi-Fi '+j.rssi+' dBm';
+mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
+streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}draw();}
+setInterval(poll,500);poll();
+</script></html>
+)HTML";
 
 static bool validPrompt(const String& s) {
   if (s.length() < 1 || s.length() > 120) return false;
@@ -361,6 +470,21 @@ static void setupWeb() {
     j["mute"] = muted;
     j["tts"] = ttsEnabled;
     j["fault"] = (int)faultMode;
+    j["now"] = millis();
+    j["mode"] = trackMode;
+    j["yaw"] = lastYaw / 10.0F;
+    j["target"] = yawTarget / 10.0F;
+    j["mic"] = (uint32_t)micLevel;
+    j["mic_on"] = micOn;
+    j["mic_allowed"] = micAllowed;
+    j["fps"] = lastFps;
+    j["api_ms"] = lastApiMs;
+    JsonArray ev = j["ev"].to<JsonArray>();
+    for (uint32_t k = evSeq > 32 ? evSeq - 32 : 0; k < evSeq; ++k) {
+      const Ev& e = evBuf[k % 32];
+      JsonObject o = ev.add<JsonObject>();
+      o["s"] = k; o["ms"] = e.ms; o["n"] = e.name; o["a"] = e.a;
+    }
     j["voice_clips"] = (bool)VOICE_CLIPS_AVAILABLE;
     JsonObject b = j["box"].to<JsonObject>();
     b["x"] = boxX; b["y"] = boxY; b["s"] = boxS;
@@ -398,6 +522,8 @@ static void setupWeb() {
     if (n == "auto") v = autoOn = !autoOn;
     else if (n == "mute") { v = muted = !muted; if (muted) M5.Speaker.stop(); }
     else if (n == "tts") v = ttsEnabled = !ttsEnabled;
+    else if (n == "mic") v = micAllowed = !micAllowed;
+    else if (n == "mode") { trackMode = (trackMode + 1) % 3; prevValid = false; v = trackMode != 0; }
     else if (n == "fault") { const int m = web.arg("v").toInt(); if (m < 0 || m > 3) { web.send(400, "text/plain", "bad fault"); return; } faultMode = m; v = m != 0; }
     else { web.send(400, "text/plain", "bad option"); return; }
     logEvent("opt", millis(), v ? 1 : 0);
@@ -586,8 +712,14 @@ void loop() {
     toGray((const uint16_t*)fb->buf, fb->width);
     CoreS3.Camera.free();
     float rcsq[4 * 16];
-    int n = find_objects(rcsq, 16, (void*)facefinder_cascade, 0.0F, gray, kH, kW, kW, 1.2F, 0.15F, 24.0F, 120.0F);
-    n = cluster_detections(rcsq, n);
+    int n = 0;
+    if (trackMode != 1) {
+      n = find_objects(rcsq, 16, (void*)facefinder_cascade, 0.0F, gray, kH, kW, kW, 1.2F, 0.15F, 24.0F, 120.0F);
+      n = cluster_detections(rcsq, n);
+    }
+    float mxv = 0, mq = 0;
+    int mbx = 0, mby = 0, mbs = 0;
+    const bool moved = trackMode != 0 && detectMotion(mxv, mbx, mby, mbs, mq, millis());
     int best = -1;
     for (int i = 0; i < n; ++i)
       if (rcsq[4 * i + 3] >= kQualityMin && (best < 0 || rcsq[4 * i + 3] > rcsq[4 * best + 3])) best = i;
@@ -600,6 +732,15 @@ void loop() {
       const float row = rcsq[4 * best], col = rcsq[4 * best + 1], s = rcsq[4 * best + 2];
       boxX = (int)((col - s / 2) * 2); boxY = (int)((row - s / 2) * 2); boxS = (int)s * 2; boxMs = millis();
       if (debugView) canvas.drawRect((int)((col - s / 2) * 2), (int)((row - s / 2) * 2), (int)s * 2, (int)s * 2, TFT_GREEN);
+    }
+    if (!present && moved) {
+      present = true;
+      bestQ = mq;
+      if (bestQ > windowMaxQ) windowMaxQ = bestQ;
+      x = mxv;
+      ++faceFrames;
+      boxX = mbx; boxY = mby; boxS = mbs; boxMs = millis();
+      if (debugView) canvas.drawRect(mbx, mby, mbs, mbs, TFT_YELLOW);
     }
     ++frames;
     now = millis();
@@ -637,6 +778,7 @@ void loop() {
   Res res;
   while (xQueueReceive(resQ, &res, 0) == pdTRUE) {
     now = millis();
+    lastApiMs = res.ms + res.ttsMs;
     logEvent("api_done", now, res.http, (long)res.ms);
     bool played = false;
     if (res.ok) {
@@ -648,6 +790,7 @@ void loop() {
         logEvent("reply_accepted", now, (long)res.id, (long)strlen(answer));
         SAY(ANSWER);
         if (res.pcmBytes && !muted) {
+          useSpeaker();
           M5.Speaker.playRaw((const int16_t*)ttsBuf, res.pcmBytes / 2, 24000, false, 1, -1, false);
           ttsPlaying = true;
           ttsPlayMs = now;
@@ -675,6 +818,30 @@ void loop() {
   if (out.state == State::error && !timeoutSaid && strcmp(status, "時間切れ") == 0) { timeoutSaid = true; SAY(TIMEOUT); }
   if (out.state == State::idle && answer[0] && !speaking) answer[0] = 0;
   if (out.state == State::idle && status[0] && now - answerStartMs > kAnswerShowMs + 3000) status[0] = 0;
+
+  // Microphone: listen while silent; a sudden loud sound makes the robot react (face, voice),
+  // also while it waits for the cloud. Nothing is recorded, stored or sent: only a level.
+  if (speaking || ttsPlaying) lastAudioMs = now;
+  if (!micOn && micAllowed && !micFailed && !speaking && !ttsPlaying && now - lastAudioMs > 600) {
+    startMic();
+    logEvent(micOn ? "mic_on" : "mic_failed", now);
+  }
+  if (micOn && !micAllowed) { M5.Mic.end(); micOn = false; }
+  // The servo motor is loud: sounds in the 1.2 s after a head command are ignored (observed 2026-10-30).
+  if (micOn && now - micStartMs > 700 && now - lastMoveMs > 1200) {
+    const uint32_t lvl = micLevel;
+    if (lvl < micFloor * 2 + 40) micFloor += ((float)lvl - micFloor) * 0.01F;
+    const float thr = micFloor * 3.0F + 250.0F;
+    if (lvl > thr && now - lastSoundMs > 1500) {
+      lastSoundMs = now;
+      core.touch(now);
+      logEvent("sound", now, (long)lvl, (long)thr);
+      if (out.state != State::waiting && now - lastListenMs > 6000) {
+        lastListenMs = now;
+        if (lvl > micFloor * 8.0F + 1200.0F) { SAY(LOUD); } else { SAY(LISTEN); }
+      }
+    }
+  }
 
   // Autonomous behaviour: the Director decides, this loop performs.
   const bool netUp = wifiOk && WiFi.status() == WL_CONNECTED;
@@ -724,6 +891,7 @@ void loop() {
     const int yaw = yawTarget;
     if (abs(yaw - lastYaw) >= 5) {
       M5StackChan.Motion.moveX(yaw, kServoSpeed);
+      lastMoveMs = now;
       logEvent("servo_yaw", now, yaw, (long)(out.normalized_x * 100));
       lastYaw = yaw;
       ++servoCmds;
@@ -745,6 +913,10 @@ void loop() {
                   (unsigned long)frames, (unsigned long)trackFrames, (unsigned long)servoCmds, windowMaxQ, lastX,
                   (unsigned long)acceptedN, (unsigned long)rejectedN, (unsigned)ESP.getFreeHeap(),
                   (unsigned long)tLoopMax, (unsigned long)tWebMax, (unsigned long)tCamMax, (unsigned long)tDrawMax);
+    lastFps = frames * 1000.0F / (now - lastFaceLogMs);
+    Serial.printf("device_monotonic_ms=%lu mic on=%d level=%lu window_max=%lu floor=%.0f\n", (unsigned long)now, (int)micOn,
+                  (unsigned long)micLevel, (unsigned long)micWindowMax, micFloor);
+    micWindowMax = 0;
     frames = faceFrames = trackFrames = servoCmds = 0;
     windowMaxQ = 0;
     tLoopMax = tWebMax = tCamMax = tDrawMax = 0;

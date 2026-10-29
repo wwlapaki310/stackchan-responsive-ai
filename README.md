@@ -2,73 +2,119 @@
 
 **考えていても、そばにいるStack-chan**
 
-クラウド生成AIの回答待ち中も、本体の軽量AIで人を認識し、首・表情・タッチ反応を継続する小型ロボット。
+クラウド生成AIの回答を待つ間も、本体の軽量AIで人を見つけ、首・表情・声・タッチ反応を止めない小型ロボット（M5Stack Stack-chan K151）。通常動作は、本体とWi-Fiとクラウドだけで完結する（PC側のプロキシは使わない）。
 
-> 2026-10-26: portable C++ policy + passing host tests + working manuscript. K151 hardware integration, face detection and API communication are not implemented or validated yet.
+> 状態（2026-10-29）: 本体への実装と実機動作の一部確認まで進んだ作業中の版。提出物（動画・説明PDF）は準備中。論文は作業草稿で、評価は完了していない。確認済みと未確認は[「確認状況」](#確認状況)に分けて書く。
 
-## 再開するとき
+## 何ができるか
 
-1. [HANDOFF.md](HANDOFF.md): 2台のPCでの再開・終了手順、現在地、次の一手。
-2. [AGENTS.md](AGENTS.md): Claude/Codex等で共通に守る開発ルール。
-3. 論文草稿: [日本語版](paper/manuscript-ja.md) / [英語版](paper/manuscript.md)。関連研究、提案方式、評価計画。
+- **見る**: 本体カメラ（320×240）の画像から、本体上で顔検出（pico）または画像の変動（フレーム差分）を行い、首（yaw）を向ける。方式はWebから切り替えられる。
+- **考える（クラウド）**: 顔を見つけて約3秒たつと、自分からSarashina APIへ質問する（Webやタッチでも質問できる）。回答は字幕で出す。
+- **待つ間も止まらない**: 回答を待つ間も、顔追従・表情・タッチ反応・「えーっと」の相づちを続ける。回答が遅れて届いても、キャンセル済みや古い要求なら捨てる。
+- **声と音**: 固定フレーズ（起動・挨拶・考え中・中止・エラーなど）を、本体のスピーカーで話す。マイクは音量だけを見て、大きな音に反応する（録音・保存・送信はしない）。
+- **操作画面**: 同じLAN内のブラウザで、首の角度の推移、回答待ちの時間帯、イベント、カメラ映像と検出枠を見られる。本体の画面は顔と字幕だけにしている。
 
-GitHubを共通の正本にする。作業終了時にコミットしてpushし、別PCではfetch/pullしてから再開する。ローカルstashだけで引き継がない。
+## 構成
 
-## 実機なしで動かす
-
-Python 3.9以上とC++17コンパイラがあれば、`python tools/host_lab.py check`でコア・再生・模擬APIを一括検証できます。[HOST_LAB.md](HOST_LAB.md)に再生ログ、模擬API、帰宅後の接続手順をまとめています。
-
-コア単体を検証するLinux/WSLの例:
-
-```sh
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude tests/host.cpp -o /tmp/stackchan-host
-/tmp/stackchan-host
+```
+                 ┌────────────── M5Stack Stack-chan K151（CoreS3: ESP32-S3, 8MB PSRAM）──────────────┐
+  カメラ ───────▶│ loop()（単一所有者）                                                                  │
+  タッチ ───────▶│  顔検出(pico) / 動き検出 ─▶ 追従制御（積分）─▶ サーボ（yaw）                           │
+  マイク ───────▶│  portable core: Interaction（状態・鮮度・キャンセル） + Director（自律動作の方針）      │──▶ 画面（顔・字幕）
+                 │  Web操作画面（LAN, トークン）                                                         │──▶ スピーカー
+                 │        ▲ キュー（要求1・結果2）                                                       │
+                 │  apiTask（別タスク）: HTTPS ──────────────────────────────────────────────────────────┼──▶ Sarashina API（TLS検証）
+                 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-macOSはclang++でも検証可能（未実行）。Windowsは出力先とコンパイラの設定を各PCで記録する。
+詳細は[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-検証項目: キャンセル・新要求開始後の遅着応答、重複応答、タイムアウト境界、顔観測の鮮度、不正時刻、タッチ表情と首追従の共存。
-このテストはポリシーの意味論だけを確認する。カメラAI、実機動作、通信、MCUの反応時間を測るものではない。
+### SWスタック
 
-## 最終課題のMVP
+| 層 | 使っているもの |
+|---|---|
+| ハードウェア | M5Stack Stack-chan K151（CoreS3、ESP32-S3、フラッシュ16MB、PSRAM 8MB、GC0308カメラ、タッチ画面、スピーカー、マイク、SCS0009サーボ×2） |
+| ビルド | arduino-cli 1.5.1、ESP32 Arduinoコア 3.3.11（FreeRTOS）、FQBN `esp32:esp32:m5stack_cores3` |
+| 本体ライブラリ | M5StackChan 1.1.1（BSP、サーボ）、M5Unified 0.2.28、M5GFX 0.2.35、M5CoreS3 1.0.1（カメラ）、ArduinoJson 7.4.3、WebServer / ESPmDNS / HTTPClient / WiFiClientSecure（コア同梱） |
+| 顔検出 | pico（Nenad Markus、MIT）を`firmware/libraries/PicoRnt`に同梱。正面顔のみ検出できる |
+| ポータブルコア | `include/interaction.hpp`（要求ID・鮮度・状態・キャンセル）、`include/director.hpp`（挨拶・質問・相づちの方針）。C++17、ESP-IDF/Arduino/ハード非依存、ホストテスト済み |
+| クラウド | Sarashina API（`sarashina3-nano`、HTTPS、Amazon Root CA 1を固定して検証）。任意でOpenAI TTS（`gpt-4o-mini-tts`）。キー未設定・残高なしでも文字だけで動く |
+| 音声 | Open JTalk + HTS Voice "Mei"（CC BY 3.0）で事前に合成した固定フレーズ。表示は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
+| PC側の道具（開発・評価のみ） | Python（秘密情報・音声の生成、実機確認、シミュレーション）、g++（ホストテスト）。デモの動作には使わない |
 
-目標: 2026-11-02 10:00 JSTまでに、通常動作がK151 + Wi-Fi + cloud APIで完結する作品を提出する。
+## 動かす
 
-- [ ] 工場ファームの復旧方法を確認。
-- [ ] 画面・タッチ・首を最小プログラムから操作。
-- [ ] 本体カメラから軽量顔検出を実行し、首を向ける。
-- [ ] 画面で質問を選び、Sarashina APIへ直接HTTPS要求。
-- [ ] 応答待ち中も顔追従とタッチ表情を継続。
-- [ ] 有効な回答へ切り替え、画面表示。
-- [ ] キャンセル・通信失敗・遅着応答を適切に処理。
-- [ ] 1–3分動画、説明PDF、提出条件に合う公開コードを準備。
+前提: Windows/Linux/macOS、arduino-cli、ESP32コア 3.3.11、上の表のライブラリ、Python 3、K151（USB接続）。
 
-開発・計測用PCは可。デモを動かすためのPC側プロキシは使わない。実験用模擬APIは別扱い。
-音声認識、NuttX、複数プロバイダ比較は追加項目。固定フレーズ音声、LAN操作画面、自律動作は2026-10-29に範囲へ追加した（HANDOFF.md）。
-追従制御の閉ループシミュレーション（`tools/track_sim.py`、結果は[docs/sim](docs/sim/README.md)）は開発・評価用で、シミュレーションの結果であり実機の測定ではない。
+```powershell
+# 1. 秘密情報（git管理外）を環境変数から生成。キーをコミットしない。
+#    SARASHINA_API_KEY, STACKCHAN_WIFI_SSID, STACKCHAN_WIFI_PASS（任意: OPENAI_API_KEY）
+powershell -NoProfile -File tools/gen_secrets.ps1
+# 2. 固定フレーズの音声を生成（任意。なければ無音で動く）
+pip install pyopenjtalk-plus numpy
+python tools/gen_voice.py
+# 3. ビルドして書き込み（Windowsは長いパスを避けるため短いビルド先を使う）
+arduino-cli compile --fqbn esp32:esp32:m5stack_cores3 --build-path C:\scb6 --libraries firmware\libraries `
+  --build-property "compiler.cpp.extra_flags=-I<このリポジトリ>/include" firmware\answer_demo
+arduino-cli upload -p COM3 --fqbn esp32:esp32:m5stack_cores3 --build-path C:\scb6 firmware\answer_demo
+```
 
-## 設計
+起動するとシリアル（115200）に`web http://<IP>/?t=<トークン>`が出る。同じLANのブラウザで開くと操作画面になる（`stackchan.local`も使える）。通信は平文のHTTPなので、信頼できるLANだけで使う。
 
-- クラウド: 回答内容を生成する。初期候補Sarashina。API仕様と利用枠は実装時に確認。
-- 本体の軽量AI: 顔の有無・位置を認識する。
-- ポータブルコア: 要求ID、鮮度、状態、首・表情の優先順位を管理する。
-- デバイスアダプタ: キュー、スケジューリング、描画、機械的可動範囲、速度制限、API入出力を担当する。
+操作: タップで反応、約0.9秒の長押しで中止・黙らせる。Webでは、質問、中止、自律・消音・読み上げ・マイク・カメラ配信の切り替え、追従方式（顔検出 / 動き / 顔→動き）の切り替えができる。
 
-首追従と画面の待機表情は独立に扱い、タッチ表情は期限付きの上書きとする。顔を見失っただけで質問はキャンセルしない。回答テキストは別途検証し、コアが要求を受理した場合だけ表示する。
-コアは単一タスク所有であり、複数スレッドから直接同時呼び出ししてはいけない。
+## 確認状況
 
-初期SDKはESP-IDF/FreeRTOSを候補とする。StackChan-BSPはArduino向けであり、そのままnative ESP-IDFに載ると仮定しない。正確な統合方法・依存バージョンは実機調査後に固定する。
+**ホストテスト**（ポリシーの意味論だけ。実機のタイミング・AI・通信は証明しない）:
 
-## 研究
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude tests/host.cpp -o /tmp/stackchan-host && /tmp/stackchan-host
+```
 
-問い: MCUの資源内で、クラウド応答を待ちながら身体反応と回答への切り替えをどう両立するか。
+**実機（K151、COM3、2026-10-27〜29）**。根拠はシリアルログとHANDOFF.mdの記録:
 
-比較: 定型待機 / 通常の並行実行 / 提案する調停方式。通常方式にも標準的なキャンセル対策を実装し、不当に弱い比較相手にしない。
-測定: ローカル反応時間、回答到着後の追加遅延、追従誤差、取りこぼし、誤実行、メモリ・推論頻度。
-新規性は引き続き検討中。ユーザー実験なしで自然さ・愛着・知覚待ち時間の改善を主張しない。
-暫定投稿候補: Frontiers in Robotics and AI / Technology and Code。投稿条件・費用・関連研究は投稿前に精査する。
+| 項目 | 状況 |
+|---|---|
+| 画面・タッチ・首（yaw ±15°） | 確認済み（目視） |
+| カメラ・顔検出・首の向き | 動作を確認。検出率は低い（顔が前にある間に約4〜50%、条件を統制していない記録）。評価値ではない |
+| Sarashinaへの直接HTTPS | 確認済み（HTTP 200、約0.7秒、証明書を固定して検証） |
+| キャンセル、遅着応答の拒否 | 確認済み（`tools/web_check.py`） |
+| 通信失敗（誤キー・到達不能・ハング）と回復 | 確認済み（`tools/fault_check.py`、故障注入） |
+| 固定フレーズの声 | 聞こえたとユーザーが報告 |
+| 自律の挨拶・質問、顔の字幕、ダッシュボード、マイク反応、動き検出 | **実装済み。実機での確認は未了** |
+| 回答の読み上げ（OpenAI TTS） | **未検証**（キーのクレジット残高なし） |
+| 積分制御の実機での効果、Wi-Fi断からの回復 | 未検証 |
+
+追従制御の比較は閉ループの**シミュレーションのみ**（[docs/sim](docs/sim/README.md)、`tools/track_sim.py`）。実機の性能ではない。
+
+## ディレクトリ
+
+| 場所 | 内容 |
+|---|---|
+| `include/` | ポータブルコア（`interaction.hpp`、`director.hpp`） |
+| `firmware/answer_demo/` | 本体のメインのスケッチ。ほかは段階的な動作確認用（minimal_ui、minimal_servo、camera_preview、face_detect、core_synthetic） |
+| `firmware/libraries/PicoRnt/` | 同梱した顔検出器（MITライセンス、出典つき） |
+| `tools/` | 秘密情報・音声の生成、実機確認（web_check、fault_check）、シミュレーション、ホスト実験 |
+| `tests/`、`HOST_LAB.md` | ホストテストと、合成イベントの再生器・模擬API |
+| `docs/` | 構成の詳細、シミュレーション |
+| `paper/` | 論文草稿（日本語・英語。評価前の作業草稿） |
+
+## 研究と範囲
+
+問い: MCUの資源内で、クラウド応答を待ちながら身体反応と回答への切り替えをどう両立するか。顔追従そのものの新規性は主張しない（公式にもUiFlow2の顔追従サンプルがある）。主張の対象は、待機中の並行動作と、遅着・取消の扱いを含む調停の構成。ユーザー実験なしで、自然さ・愛着・待ち時間の短縮は主張しない。新規性は引き続き検討中。
+
+M5Stack公式の[StackChan Issue #70](https://github.com/m5stack/StackChan/issues/70)（会話中の視覚追従）は、公式のAIエージェントのファームに顔検出を足すとメモリ不足になると報告している。本プロジェクトは別のファームで、音声認識などは含まない。
+
+範囲（2026-10-29に見直し）: 固定フレーズ音声、LAN操作画面、自律動作、マイクの音量反応は範囲内。ROS・シミュレータを使う場合は開発・評価の道具に限る。
+
+## 再開するとき（開発者向け）
+
+1. [HANDOFF.md](HANDOFF.md): 現在地、実機の記録、次の一手。
+2. [AGENTS.md](AGENTS.md): Claude/Codex等で共通に守る開発ルール。
+3. 論文草稿: [日本語版](paper/manuscript-ja.md) / [英語版](paper/manuscript.md)。
+
+GitHubを正本にする。作業終了時にコミットしてpushし、別PCではfetch/pullしてから再開する。force pushしない。
 
 ## データとライセンス
 
-APIキー、Wi-Fi情報、生画像、私的会話、機器ダンプ、講座PDFをコミットしない。
-プロジェクトライセンスは未決定。第三者コードの取り込み時はライセンスと依存バージョンを記録する。
+APIキー、Wi-Fi情報、生画像、私的会話、機器ダンプ、講座PDFをコミットしない。MITライセンス（[LICENSE](LICENSE)）。第三者の成果物は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
