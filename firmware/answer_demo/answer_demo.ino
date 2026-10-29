@@ -8,7 +8,7 @@
 // is rejected by the core (request id check).
 //
 // Build: tools/gen_secrets.ps1 first (writes the git-ignored secrets.h), optionally
-// tools/gen_voice.ps1 (fixed phrases), then see HANDOFF.md.
+// tools/gen_voice.py (fixed phrases, Open JTalk), then see HANDOFF.md.
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -96,6 +96,7 @@ static QueueHandle_t reqQ, resQ;
 static uint8_t* ttsBuf = nullptr;                          // PSRAM; 24 kHz s16le from the TTS service
 static volatile bool ttsHeld = false;                      // true while ttsBuf holds audio not yet played out
 static volatile bool ttsEnabled = true;
+static volatile int faultMode = 0;                         // test only (web /opt?n=fault&v=): 1 bad key, 2 unreachable host, 3 hang 16 s
 static volatile uint64_t wantedId = 0;                     // id loop() still wants; lets the task skip useless TTS
 
 static bool validAnswer(const char* s, size_t n) {
@@ -156,9 +157,10 @@ static void apiTask(void*) {
       cli.setCACert(kRootCa);
       HTTPClient http;
       http.setTimeout(kHttpTimeoutMs);
-      if (http.begin(cli, kApiUrl)) {
+      if (faultMode == 3) vTaskDelay(pdMS_TO_TICKS(16000));    // simulated hang: the core times out first
+      if (http.begin(cli, faultMode == 2 ? "https://10.255.255.1/v1/chat/completions" : kApiUrl)) {
         http.addHeader("Content-Type", "application/json");
-        http.addHeader("Authorization", String("Bearer ") + SARASHINA_API_KEY);
+        http.addHeader("Authorization", String("Bearer ") + (faultMode == 1 ? "invalid" : SARASHINA_API_KEY));
         JsonDocument req;
         req["model"] = kModel;
         req["max_completion_tokens"] = 80;
@@ -358,6 +360,7 @@ static void setupWeb() {
     j["auto"] = autoOn;
     j["mute"] = muted;
     j["tts"] = ttsEnabled;
+    j["fault"] = (int)faultMode;
     j["voice_clips"] = (bool)VOICE_CLIPS_AVAILABLE;
     JsonObject b = j["box"].to<JsonObject>();
     b["x"] = boxX; b["y"] = boxY; b["s"] = boxS;
@@ -395,6 +398,7 @@ static void setupWeb() {
     if (n == "auto") v = autoOn = !autoOn;
     else if (n == "mute") { v = muted = !muted; if (muted) M5.Speaker.stop(); }
     else if (n == "tts") v = ttsEnabled = !ttsEnabled;
+    else if (n == "fault") { const int m = web.arg("v").toInt(); if (m < 0 || m > 3) { web.send(400, "text/plain", "bad fault"); return; } faultMode = m; v = m != 0; }
     else { web.send(400, "text/plain", "bad option"); return; }
     logEvent("opt", millis(), v ? 1 : 0);
     web.send(200, "text/plain", v ? "on" : "off");
