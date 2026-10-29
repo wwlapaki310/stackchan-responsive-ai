@@ -7,7 +7,7 @@ The GitHub repository is the shared source of truth. Push committed work before 
 
 - Initial deliverable: K151 screen question, direct cloud request, on-device face detection, head tracking, touch feedback, answer display and cancellation.
 - Keep portable coordination code independent of ESP-IDF, Arduino, providers and hardware.
-- Do not introduce ROS, speech/TTS, NuttX or multiple providers into the MVP without revisiting scope.
+- Do not introduce ROS, NuttX or multiple providers into the MVP without revisiting scope. Scope revisited 2026-10-29: fixed-phrase speech, an optional LAN control page and autonomous behaviour are in; cloud TTS stays optional. ROS/simulators, if used, are development and evaluation tools only; normal operation stays board + Wi-Fi + cloud API.
 - The official StackChan-BSP is Arduino-oriented; do not assume it is a drop-in native ESP-IDF component. Hardware adapter/toolchain choice remains open.
 
 ## Verification
