@@ -76,7 +76,7 @@ static const char* const kAutoPrompts[] = {
     "目の前の人に、答えやすい軽い質問を一つしてください。",
     "あなた自身の自己紹介を一言でお願いします。",
 };
-static const char* kSystemPrompt = "あなたは小さな卓上ロボットです。日本語で、40文字以内の一文で答えてください。";
+static const char* kSystemPrompt = "あなたは小さな卓上ロボットです。日本語で、40文字以内の一文で答えてください。【状況】があれば、それに合わせて答えてください。";
 
 // ---- speaker ------------------------------------------------------------------------
 static bool muted = false;
@@ -126,12 +126,12 @@ static void sayClip(int id) {
 #endif
 
 // ---- API task plumbing -----------------------------------------------------------
-struct Req { uint64_t id; char prompt[128]; };
+struct Req { uint64_t id; char prompt[256]; };
 struct Res { uint64_t id; bool ok; int http; uint32_t ms; uint32_t pcmBytes; int ttsHttp; uint32_t ttsMs; char text[kMaxAnswerBytes + 1]; };
 static QueueHandle_t reqQ, resQ;
 static uint8_t* ttsBuf = nullptr;                          // PSRAM; 24 kHz s16le from the TTS service
 static volatile bool ttsHeld = false;                      // true while ttsBuf holds audio not yet played out
-static volatile bool ttsEnabled = true;
+static volatile bool ttsEnabled = false;                   // opt-in from the web page: needs an OpenAI key with credit
 static volatile int faultMode = 0;                         // test only (web /opt?n=fault&v=): 1 bad key, 2 unreachable host, 3 hang 16 s
 static volatile uint64_t wantedId = 0;                     // id loop() still wants; lets the task skip useless TTS
 
@@ -247,6 +247,7 @@ static uint32_t acceptedN = 0, rejectedN = 0;
 static float lastX = 0, bestQ = 0, windowMaxQ = 0;
 static int lastYaw = 0, yawTarget = 0;
 static bool prevTrack = false, smoothValid = false;
+static uint32_t trackStartMs = 0, lastSoundSeenMs = 0, soundN = 0;   // inputs of the one-line scene description sent to the cloud
 static float smoothX = 0;
 static uint32_t lastTrackMs = 0;
 static constexpr uint32_t kHoldMs = 3000;                  // keep the head still this long after the face is lost
@@ -337,6 +338,17 @@ static bool detectMotion(float& x, int& bx, int& by, int& bs, float& quality, ui
   memcpy(prevGray, gray, sizeof(prevGray));
   prevValid = true;
   return found;
+}
+
+// What the robot perceived, as one line of text for the cloud model. Only these derived facts
+// (tracking time, a loudness flag, head direction) leave the board: never the image or the sound.
+static void sceneText(char* out, size_t n, uint32_t now) {
+  const int secs = prevTrack ? (int)((now - trackStartMs) / 1000) : 0;
+  const char* side = lastYaw > 150 ? "右" : (lastYaw < -150 ? "左" : "正面");
+  const bool loud = soundN > 0 && now - lastSoundSeenMs < 20000;
+  snprintf(out, n, "【状況】%s。顔が見えている時間は約%d秒。顔の向きは%s。%s",
+           prevTrack ? "目の前に人がいる" : "人は見えない", secs, side,
+           loud ? "直前に大きな音がした。" : "周りは静か。");
 }
 
 static bool startPrompt(const char* prompt, int tag, uint32_t now) {
@@ -836,6 +848,8 @@ void loop() {
       lastSoundMs = now;
       core.touch(now);
       logEvent("sound", now, (long)lvl, (long)thr);
+      ++soundN;
+      lastSoundSeenMs = now;
       if (out.state != State::waiting && now - lastListenMs > 6000) {
         lastListenMs = now;
         if (lvl > micFloor * 8.0F + 1200.0F) { SAY(LOUD); } else { SAY(LISTEN); }
@@ -853,7 +867,11 @@ void loop() {
       break;
     case Act::ask: {
       const char* p = kAutoPrompts[autoIndex++ % (sizeof(kAutoPrompts) / sizeof(kAutoPrompts[0]))];
-      if (startPrompt(p, 20 + (int)((autoIndex - 1) % 10), now)) { SAY(ASK); logEvent("auto_ask", now); }
+      char full[sizeof(Req::prompt)];
+      char scene[112];
+      sceneText(scene, sizeof(scene), now);
+      snprintf(full, sizeof(full), "%s%s", scene, p);
+      if (startPrompt(full, 20 + (int)((autoIndex - 1) % 10), now)) { SAY(ASK); logEvent("auto_ask", now); }
       break;
     }
     case Act::filler:
@@ -875,6 +893,7 @@ void loop() {
     if (out.track_head != prevTrack) {
       logEvent(out.track_head ? "track_on" : "track_off", now, (long)(out.normalized_x * 100), (long)(bestQ * 10));
       prevTrack = out.track_head;
+      if (out.track_head) trackStartMs = now;
       if (!out.track_head) smoothValid = false;
     }
     if (out.track_head) { ++trackFrames; lastTrackMs = now; }
