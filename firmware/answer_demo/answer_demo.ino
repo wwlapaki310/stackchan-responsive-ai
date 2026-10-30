@@ -333,7 +333,8 @@ static bool patrolOn = false;                 // patrol: sweep the head over the
 static int patrolDir = 1;
 static uint32_t nextPatrolMs = 0, lookN = 0, lastLookMs = 0;   // lookN: camera frames sent to the cloud since boot
 static constexpr int kPatrolYaw = 1100;                    // +-110 deg (servo range +-128)
-static constexpr int kPatrolStep = 25;                     // 2.5 deg per 100 ms servo tick = 25 deg/s
+static constexpr int kPatrolStep = 40;                     // 4 deg per 100 ms servo tick = 40 deg/s
+static constexpr int kPatrolLead = 400;                    // aim 40 deg ahead of the logical position while sweeping
 static constexpr uint32_t kLookCooldownMs = 60000;         // autonomous sends at most once a minute (free-tier quota)
 static uint32_t trackStartMs = 0, lastSoundSeenMs = 0, soundN = 0;   // inputs of the one-line scene description sent to the cloud
 static float smoothX = 0;
@@ -1050,7 +1051,10 @@ void loop() {
         yawTarget = 0;
       }
     }
-    const int yaw = yawTarget;
+    // While sweeping, aim well ahead of the logical position so the servo keeps moving instead of
+    // stopping after every 2.5 deg step (that looked like small repeated twitches).
+    const bool sweeping = patrolOn && !out.track_head && now - lastTrackMs > kHoldMs && now >= nextPatrolMs;
+    const int yaw = sweeping ? constrain(yawTarget + patrolDir * kPatrolLead, -kPatrolYaw, kPatrolYaw) : yawTarget;
     if (abs(yaw - lastYaw) >= 5) {
       M5StackChan.Motion.moveX(yaw, kServoSpeed);
       lastMoveMs = now;
