@@ -19,6 +19,7 @@
 #include <M5StackChan.h>
 #include <M5CoreS3.h>
 #include "esp_camera.h"
+#include "mbedtls/base64.h"
 extern "C" {
 #include "picornt.h"
 }
@@ -47,6 +48,10 @@ static const char* kTtsUrl = "https://api.openai.com/v1/audio/speech";
 static const char* kTtsModel = "gpt-4o-mini-tts";          // OpenAI marks it deprecated, shutdown 2027-01-06
 static const char* kTtsVoice = "coral";
 static const char* kTtsStyle = "明るく親しみやすい、少し高めの声の日本語で、はっきり話してください。";
+// Optional vision: one camera frame (JPEG) goes to a multimodal cloud model, only when the
+// operator enables it on the web page and only for an explicit "look" or an autonomous ask.
+static const char* kLookUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";   // 2.5 models answered 404 for this key (2026-10-30)
+static const char* kLookPrompt = "添付の画像は、あなたの目(カメラ)に今映っているものです。見えているものに触れて、ロボットとして一言で話しかけてください。";
 static constexpr uint32_t kHttpTimeoutMs = 12000;          // < core timeout (15000)
 static constexpr uint32_t kTtsTimeoutMs = 9000;
 static constexpr size_t kTtsMaxBytes = 24000 * 2 * 8;      // 8 s of 24 kHz 16-bit mono
@@ -126,7 +131,8 @@ static void sayClip(int id) {
 #endif
 
 // ---- API task plumbing -----------------------------------------------------------
-struct Req { uint64_t id; char prompt[256]; };
+struct Req { uint64_t id; char prompt[256]; uint8_t* jpg; uint32_t jpgLen; };   // jpg: malloc'd, owned and freed by apiTask
+static volatile bool visionEnabled = false;                // opt-in from the web page: sends camera frames to the cloud
 struct Res { uint64_t id; bool ok; int http; uint32_t ms; uint32_t pcmBytes; int ttsHttp; uint32_t ttsMs; char text[kMaxAnswerBytes + 1]; };
 static QueueHandle_t reqQ, resQ;
 static uint8_t* ttsBuf = nullptr;                          // PSRAM; 24 kHz s16le from the TTS service
@@ -180,6 +186,54 @@ static size_t fetchTts(const char* text, int& code) {
   return n;
 }
 
+// One image + prompt to the multimodal model. Returns the HTTP code (200 = text filled).
+static int askGemini(const char* prompt, const uint8_t* jpg, size_t jpgLen, char* text, size_t cap) {
+  JsonDocument d;
+  d["systemInstruction"]["parts"][0]["text"] = kSystemPrompt;
+  JsonObject p0 = d["contents"][0]["parts"][0].to<JsonObject>();
+  p0["inline_data"]["mime_type"] = "image/jpeg";
+  p0["inline_data"]["data"] = "@@";
+  d["contents"][0]["parts"][1]["text"] = prompt;
+  d["generationConfig"]["maxOutputTokens"] = 300;           // headroom in case the model spends tokens on thinking
+  String s; serializeJson(d, s);
+  const int at = s.indexOf("@@");
+  size_t b64 = 0;
+  mbedtls_base64_encode(nullptr, 0, &b64, jpg, jpgLen);
+  const size_t total = s.length() - 2 + b64;
+  char* body = (char*)ps_malloc(total + 1);
+  if (at < 0 || !body) { free(body); return -102; }
+  memcpy(body, s.c_str(), at);
+  size_t olen = 0;
+  mbedtls_base64_encode((uint8_t*)body + at, b64 + 1, &olen, jpg, jpgLen);
+  memcpy(body + at + olen, s.c_str() + at + 2, s.length() - at - 2);
+  const size_t len = at + olen + s.length() - at - 2;
+  WiFiClientSecure cli;
+  cli.setCACertBundle(rootca_crt_bundle_start, rootca_crt_bundle_end - rootca_crt_bundle_start);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(kHttpTimeoutMs);
+  int code = -101;
+  if (http.begin(cli, kLookUrl)) {
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-goog-api-key", GEMINI_API_KEY);
+    code = http.POST((uint8_t*)body, len);
+    if (code == 200) {
+      JsonDocument filter; filter["candidates"][0]["content"]["parts"][0]["text"] = true;
+      JsonDocument doc;
+      if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
+        const char* c = doc["candidates"][0]["content"]["parts"][0]["text"] | "";
+        size_t n = strlen(c);
+        if (n > cap - 1) { n = cap - 1; while (n > 0 && ((uint8_t)c[n] & 0xC0) == 0x80) --n; }   // cut on a character boundary
+        if (n == 0) code = -200;
+        else { memcpy(text, c, n); text[n] = 0; }
+      } else code = -201;
+    }
+    http.end();
+  }
+  free(body);
+  return code;
+}
+
 static void apiTask(void*) {
   Req r;
   for (;;) {
@@ -188,6 +242,9 @@ static void apiTask(void*) {
     const uint32_t t0 = millis();
     if (WiFi.status() != WL_CONNECTED || !strlen(SARASHINA_API_KEY)) {
       res.http = -100;
+    } else if (r.jpg) {
+      res.http = strlen(GEMINI_API_KEY) ? askGemini(r.prompt, r.jpg, r.jpgLen, res.text, sizeof(res.text)) : -103;
+      res.ok = res.http == 200;
     } else {
       WiFiClientSecure cli;
       cli.setCACert(kRootCa);
@@ -219,6 +276,7 @@ static void apiTask(void*) {
       } else res.http = -101;
     }
     res.ms = millis() - t0;
+    if (r.jpg) free(r.jpg);
     if (res.ok && wantedId == r.id) {                  // speech only for an answer somebody still wants
       const uint32_t t1 = millis();
       res.pcmBytes = (uint32_t)fetchTts(res.text, res.ttsHttp);
@@ -351,9 +409,9 @@ static void sceneText(char* out, size_t n, uint32_t now) {
            loud ? "直前に大きな音がした。" : "周りは静か。");
 }
 
-static bool startPrompt(const char* prompt, int tag, uint32_t now) {
+static bool startPrompt(const char* prompt, int tag, uint32_t now, uint8_t* jpg = nullptr, size_t jpgLen = 0) {
   const uint64_t id = core.start(now);
-  if (id == 0) return false;
+  if (id == 0) { free(jpg); return false; }
   activeId = id;
   wantedId = id;
   answer[0] = 0;
@@ -361,9 +419,27 @@ static bool startPrompt(const char* prompt, int tag, uint32_t now) {
   timeoutSaid = false;
   Req r = {id, {0}};
   strncpy(r.prompt, prompt, sizeof(r.prompt) - 1);
-  xQueueSend(reqQ, &r, 0);
+  r.jpg = jpg;
+  r.jpgLen = (uint32_t)jpgLen;
+  if (xQueueSend(reqQ, &r, 0) != pdTRUE) free(jpg);
   logEvent("start", now, (long)id, tag);            // the prompt text itself is never logged
   return true;
+}
+
+// Take one camera frame and ask the multimodal model about it. The JPEG lives only in RAM until
+// the request is done; it is never stored or logged.
+static bool startLook(uint32_t now) {
+  if (!visionEnabled || !strlen(GEMINI_API_KEY) || !cameraOk || !CoreS3.Camera.get()) return false;
+  uint8_t* jpg = nullptr;
+  size_t len = 0;
+  const bool ok = frame2jpg(CoreS3.Camera.fb, 50, &jpg, &len);
+  CoreS3.Camera.free();
+  if (!ok || !jpg) return false;
+  char scene[112];
+  sceneText(scene, sizeof(scene), now);
+  char full[sizeof(Req::prompt)];
+  snprintf(full, sizeof(full), "%s%s", scene, kLookPrompt);
+  return startPrompt(full, 30, now, jpg, len);
 }
 
 // Cancel whatever is going on: a pending request, an answer being shown, speech.
@@ -401,7 +477,7 @@ button{font-size:1.05em;padding:.5em .9em;margin:.2em}input{width:100%;font-size
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
 <p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">本体の表示切替</button></p>
-<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button></p>
+<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button><button id="b_vision" onclick="opt('vision')">視覚(画像をクラウドへ送る)</button><button onclick="post('/look')">見て</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
@@ -438,7 +514,7 @@ for(const e of j.ev){if(e.s>lastSeq){lastSeq=e.s;events.push({t:e.ms+off,n:e.n,a
 document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');
 document.getElementById('n_fps').textContent='検出 '+j.fps.toFixed(1)+' fps';document.getElementById('n_api').textContent='API '+j.api_ms+' ms';
 document.getElementById('n_mic').textContent='音 '+j.mic+(j.mic_on?'':' (停止中)');document.getElementById('n_rssi').textContent='Wi-Fi '+j.rssi+' dBm';
-mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
+mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);mark('b_vision',j.vision);document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
 streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}draw();}
 setInterval(poll,500);poll();
 </script></html>
@@ -481,6 +557,8 @@ static void setupWeb() {
     j["auto"] = autoOn;
     j["mute"] = muted;
     j["tts"] = ttsEnabled;
+    j["vision"] = visionEnabled;
+    j["vision_key"] = strlen(GEMINI_API_KEY) > 0;
     j["fault"] = (int)faultMode;
     j["now"] = millis();
     j["mode"] = trackMode;
@@ -521,6 +599,15 @@ static void setupWeb() {
     if (ok) { lastWebAskMs = now; SAY(ASK); }
     web.send(ok ? 200 : 500, "text/plain", ok ? "started" : "failed");
   });
+  web.on("/look", HTTP_POST, [] {
+    if (!authorized()) return;
+    const uint32_t now = millis();
+    if (!visionEnabled) { web.send(409, "text/plain", "vision off"); return; }
+    if (now - lastWebAskMs < 2000) { web.send(429, "text/plain", "slow down"); return; }
+    const bool ok = startLook(now);
+    if (ok) { lastWebAskMs = now; SAY(ASK); }
+    web.send(ok ? 200 : 500, "text/plain", ok ? "started" : "failed");
+  });
   web.on("/cancel", HTTP_POST, [] {
     if (!authorized()) return;
     const bool ok = doCancel(millis());
@@ -535,6 +622,7 @@ static void setupWeb() {
     else if (n == "mute") { v = muted = !muted; if (muted) M5.Speaker.stop(); }
     else if (n == "tts") v = ttsEnabled = !ttsEnabled;
     else if (n == "mic") v = micAllowed = !micAllowed;
+    else if (n == "vision") v = visionEnabled = !visionEnabled;
     else if (n == "mode") { trackMode = (trackMode + 1) % 3; prevValid = false; v = trackMode != 0; }
     else if (n == "fault") { const int m = web.arg("v").toInt(); if (m < 0 || m > 3) { web.send(400, "text/plain", "bad fault"); return; } faultMode = m; v = m != 0; }
     else { web.send(400, "text/plain", "bad option"); return; }
@@ -866,6 +954,10 @@ void loop() {
       logEvent("auto_greet", now);
       break;
     case Act::ask: {
+      if (visionEnabled && strlen(GEMINI_API_KEY)) {
+        if (startLook(now)) { SAY(ASK); logEvent("auto_look", now); }
+        break;
+      }
       const char* p = kAutoPrompts[autoIndex++ % (sizeof(kAutoPrompts) / sizeof(kAutoPrompts[0]))];
       char full[sizeof(Req::prompt)];
       char scene[112];
