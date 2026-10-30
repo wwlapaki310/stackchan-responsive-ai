@@ -329,6 +329,12 @@ static uint32_t acceptedN = 0, rejectedN = 0;
 static float lastX = 0, bestQ = 0, windowMaxQ = 0;
 static int lastYaw = 0, yawTarget = 0;
 static bool prevTrack = false, smoothValid = false;
+static bool patrolOn = false;                 // patrol: sweep the head over the full range while nobody is seen
+static int patrolDir = 1;
+static uint32_t nextPatrolMs = 0, lookN = 0, lastLookMs = 0;   // lookN: camera frames sent to the cloud since boot
+static constexpr int kPatrolYaw = 1100;                    // +-110 deg (servo range +-128)
+static constexpr int kPatrolStep = 25;                     // 2.5 deg per 100 ms servo tick = 25 deg/s
+static constexpr uint32_t kLookCooldownMs = 60000;         // autonomous sends at most once a minute (free-tier quota)
 static uint32_t trackStartMs = 0, lastSoundSeenMs = 0, soundN = 0;   // inputs of the one-line scene description sent to the cloud
 static float smoothX = 0;
 static uint32_t lastTrackMs = 0;
@@ -463,7 +469,9 @@ static bool startLook(uint32_t now) {
   sceneText(scene, sizeof(scene), now);
   char full[sizeof(Req::prompt)];
   snprintf(full, sizeof(full), "%s%s", scene, kLookPrompt);
-  return startPrompt(full, 30, now, jpg, len);
+  const bool started = startPrompt(full, 30, now, jpg, len);
+  if (started) { lastLookMs = now; ++lookN; }
+  return started;
 }
 
 // Cancel whatever is going on: a pending request, an answer being shown, speech.
@@ -501,7 +509,7 @@ button{font-size:1.05em;padding:.5em .9em;margin:.2em}input{width:100%;font-size
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
 <p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">本体の表示切替</button></p>
-<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button><button id="b_vision" onclick="opt('vision')">判断</button><button onclick="post('/look')">見て</button></p>
+<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button><button id="b_patrol" onclick="opt('patrol')">監視</button><button id="b_vision" onclick="opt('vision')">判断</button><button onclick="post('/look')">見て</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
@@ -538,7 +546,7 @@ for(const e of j.ev){if(e.s>lastSeq){lastSeq=e.s;events.push({t:e.ms+off,n:e.n,a
 document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');
 document.getElementById('n_fps').textContent='検出 '+j.fps.toFixed(1)+' fps';document.getElementById('n_api').textContent='API '+j.api_ms+' ms';
 document.getElementById('n_mic').textContent='音 '+j.mic+(j.mic_on?'':' (停止中)');document.getElementById('n_rssi').textContent='Wi-Fi '+j.rssi+' dBm';
-mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);mark('b_vision',j.vision);document.getElementById('b_vision').textContent='判断: '+['本体のみ(画像は送らない)','「見て」のときだけGemini','常にGemini'][j.vision];document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
+mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);mark('b_vision',j.vision);document.getElementById('b_vision').textContent='判断: '+['本体のみ(画像は送らない)','「見て」のときだけGemini','常にGemini(1分に1回まで)'][j.vision]+' / 送信'+j.look_n+'回'+(j.look_wait?' 次まで'+j.look_wait+'秒':'');mark('b_patrol',j.patrol);document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
 streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}draw();}
 setInterval(poll,500);poll();
 </script></html>
@@ -583,6 +591,9 @@ static void setupWeb() {
     j["tts"] = ttsEnabled;
     j["vision"] = (int)judgeMode;
     j["vision_key"] = strlen(GEMINI_API_KEY) > 0;
+    j["patrol"] = patrolOn;
+    j["look_n"] = lookN;
+    j["look_wait"] = (lookN == 0 || millis() - lastLookMs >= kLookCooldownMs) ? 0 : (long)((kLookCooldownMs - (millis() - lastLookMs)) / 1000);
     j["fault"] = (int)faultMode;
     j["now"] = millis();
     j["mode"] = trackMode;
@@ -646,6 +657,7 @@ static void setupWeb() {
     else if (n == "mute") { v = muted = !muted; if (muted) M5.Speaker.stop(); }
     else if (n == "tts") v = ttsEnabled = !ttsEnabled;
     else if (n == "mic") v = micAllowed = !micAllowed;
+    else if (n == "patrol") { v = patrolOn = !patrolOn; patrolDir = 1; nextPatrolMs = 0; }
     else if (n == "vision") { judgeMode = (judgeMode + 1) % 3; v = judgeMode != 0; }
     else if (n == "mode") { trackMode = (trackMode + 1) % 3; prevValid = false; v = trackMode != 0; }
     else if (n == "fault") { const int m = web.arg("v").toInt(); if (m < 0 || m > 3) { web.send(400, "text/plain", "bad fault"); return; } faultMode = m; v = m != 0; }
@@ -883,7 +895,7 @@ void loop() {
       // face ends up centred. Applying it per detection (not per servo tick) avoids
       // integrating one stale observation several times.
       if (fabsf(smoothX) > kDeadband)
-        yawTarget = constrain(yawTarget + kYawSign * (int)(smoothX * kYawGain), -kYawMax, kYawMax);
+        yawTarget = constrain(yawTarget + kYawSign * (int)(smoothX * kYawGain), patrolOn ? -kPatrolYaw : -kYawMax, patrolOn ? kPatrolYaw : kYawMax);
     }
   }
 
@@ -985,7 +997,8 @@ void loop() {
       logEvent("auto_greet", now);
       break;
     case Act::ask: {
-      if (judgeMode == 2 && strlen(GEMINI_API_KEY)) {
+      // Autonomous image sends are rationed: at most one per kLookCooldownMs, otherwise a text question.
+      if (judgeMode == 2 && strlen(GEMINI_API_KEY) && (lookN == 0 || now - lastLookMs >= kLookCooldownMs)) {
         if (startLook(now)) { SAY(ASK); logEvent("auto_look", now); }
         break;
       }
@@ -1021,7 +1034,14 @@ void loop() {
     }
     if (out.track_head) { ++trackFrames; lastTrackMs = now; }
     if (!out.track_head && now - lastTrackMs > kHoldMs) {
-      if (autoOn && out.state == State::idle) {
+      if (patrolOn) {                                  // sweep to both limits, pause briefly at each end
+        if (now >= nextPatrolMs) {
+          yawTarget += patrolDir * kPatrolStep;
+          nextPatrolMs = now;
+          if (yawTarget >= kPatrolYaw) { yawTarget = kPatrolYaw; patrolDir = -1; nextPatrolMs = now + 600; }
+          if (yawTarget <= -kPatrolYaw) { yawTarget = -kPatrolYaw; patrolDir = 1; nextPatrolMs = now + 600; }
+        }
+      } else if (autoOn && out.state == State::idle) {
         if (now >= nextWanderMs) {
           yawTarget = (int)random(-kWanderYaw, kWanderYaw + 1);
           nextWanderMs = now + (uint32_t)random(3500, 7000);
