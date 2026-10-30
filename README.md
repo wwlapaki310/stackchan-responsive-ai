@@ -4,7 +4,11 @@
 
 クラウド生成AIの回答を待つ間も、本体の軽量AIで人を見つけ、首・表情・声・タッチ反応を止めない小型ロボット（M5Stack Stack-chan K151）。通常動作は、本体とWi-Fiとクラウドだけで完結する（PC側のプロキシは使わない）。
 
-> 状態（2026-10-29）: 本体への実装と実機動作の一部確認まで進んだ作業中の版。提出物（動画・説明PDF）は準備中。論文は作業草稿で、評価は完了していない。確認済みと未確認は[「確認状況」](#確認状況)に分けて書く。
+> 状態（2026-10-30）: 実機で動く作業版。評価実験は未実施で、論文は作業草稿。確認済みと未確認は[「確認状況」](#確認状況)に分けて書く。
+
+- デモ動画: （撮影後にYouTubeのURLを追記）
+- 説明資料: [docs/SUBMISSION.md](docs/SUBMISSION.md)（実装と計画の区別、実機の記録、限界）
+- 動画の台本: [docs/DEMO.md](docs/DEMO.md)　構成の詳細: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)　シミュレーション: [docs/sim](docs/sim/README.md)
 
 ## 何ができるか
 
@@ -89,7 +93,9 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude tests/host.cpp -o /tmp/
 | 再起動 | 読み上げ・「見て」を繰り返すと、本体が再起動することがある（ヒープ破損のassert、またはオーディオタスクの例外）。原因未特定。直近の4回の試験では0回 |
 | 積分制御の実機での効果、Wi-Fi断からの回復 | 未検証 |
 
-追従制御の比較は閉ループの**シミュレーションのみ**（[docs/sim](docs/sim/README.md)、`tools/track_sim.py`）。実機の性能ではない。
+追従制御の比較は閉ループの**シミュレーションのみ**（[docs/sim](docs/sim/README.md)、`tools/track_sim.py`）。画角とサーボ速度は仮定で、実機の性能ではない。
+
+![追従制御のシミュレーション（比例と積分の比較。仮定つき）](docs/sim/track_sim.png)
 
 ## ディレクトリ
 
