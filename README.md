@@ -38,7 +38,7 @@
 | 本体ライブラリ | M5StackChan 1.1.1（BSP、サーボ）、M5Unified 0.2.28、M5GFX 0.2.35、M5CoreS3 1.0.1（カメラ）、ArduinoJson 7.4.3、WebServer / ESPmDNS / HTTPClient / WiFiClientSecure（コア同梱） |
 | 顔検出 | pico（Nenad Markus、MIT）を`firmware/libraries/PicoRnt`に同梱。正面顔のみ検出できる |
 | ポータブルコア | `include/interaction.hpp`（要求ID・鮮度・状態・キャンセル）、`include/director.hpp`（挨拶・質問・相づちの方針）。C++17、ESP-IDF/Arduino/ハード非依存、ホストテスト済み |
-| クラウド | Sarashina API（`sarashina3-nano`、HTTPS、Amazon Root CA 1を固定して検証）。任意でOpenAI TTS（`gpt-4o-mini-tts`）。キー未設定・残高なしでも文字だけで動く |
+| クラウド | Sarashina API（`sarashina3-nano`、HTTPS、Amazon Root CA 1を固定して検証）。任意でGemini API（画像1枚の解釈`gemini-3.5-flash-lite`、回答の読み上げ`gemini-3.8-flash-tts`）。Geminiのキーがなくても、文字とSarashinaだけで動く |
 | 音声 | Open JTalk + HTS Voice "Mei"（CC BY 3.0）で事前に合成した固定フレーズ。表示は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
 | PC側の道具（開発・評価のみ） | Python（秘密情報・音声の生成、実機確認、シミュレーション）、g++（ホストテスト）。デモの動作には使わない |
 
@@ -48,7 +48,7 @@
 
 ```powershell
 # 1. 秘密情報（git管理外）を環境変数から生成。キーをコミットしない。
-#    SARASHINA_API_KEY, STACKCHAN_WIFI_SSID, STACKCHAN_WIFI_PASS（任意: OPENAI_API_KEY）
+#    SARASHINA_API_KEY, STACKCHAN_WIFI_SSID, STACKCHAN_WIFI_PASS（任意: GEMINI_API_KEY。画像の解釈と読み上げ用）
 powershell -NoProfile -File tools/gen_secrets.ps1
 # 2. 固定フレーズの音声を生成（任意。なければ無音で動く）
 pip install pyopenjtalk-plus numpy
@@ -61,7 +61,7 @@ arduino-cli upload -p COM3 --fqbn esp32:esp32:m5stack_cores3 --build-path C:\scb
 
 起動するとシリアル（115200）に`web http://<IP>/?t=<トークン>`が出る。同じLANのブラウザで開くと操作画面になる（`stackchan.local`も使える）。通信は平文のHTTPなので、信頼できるLANだけで使う。
 
-操作: タップで反応、約0.9秒の長押しで中止・黙らせる。Webでは、質問、中止、自律・消音・読み上げ・マイク・カメラ配信の切り替え、追従方式（顔検出 / 動き / 顔→動き）の切り替えができる。
+操作: タップで反応、約0.9秒の長押しで中止・黙らせる。Webでは、質問、「見て」、中止、自律・消音・読み上げ・マイク・カメラ配信の切り替え、追従方式（顔検出 / 動き / 顔→動き）、判断（本体のみ / 「見て」のときだけGemini / 常にGemini）の切り替えができる。**画像は、判断をオンにして「見て」（または常にGemini）のときだけ、1枚をGeminiへ送る。既定はオフ。**
 
 ## 確認状況
 
@@ -85,7 +85,8 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude tests/host.cpp -o /tmp/
 | 質問の繰り返し | 読み上げをオフにして31回、パニック0、API 526〜806 ms。読み上げを有効にすると、約25回で2〜3回再起動した（原因未特定、既定をオフにした） |
 | 視覚（「見て」: カメラ1枚をGeminiへ送り、見えているものに触れた一言を返す） | 実機で動作確認（5回、応答5〜14秒でばらつく、1回は時間切れ）。既定オフ、有効にしたときだけ画像がクラウドへ出る |
 | 動き検出モード、状況文つきの自律質問 | 実装済み。実機での効果は未確認 |
-| 回答の読み上げ（OpenAI TTS） | **未検証**（キーのクレジット残高なし） |
+| 回答の読み上げ（Gemini TTS） | 実機で動作確認（音声が返り再生）。無料枠の回数制限（429）や通信失敗の回がある（字幕だけになる）。読み上げ末尾のノイズは、WAVのメタデータを再生していたのが原因で、修正済み（ユーザーの再確認は未了） |
+| 再起動 | 読み上げ・「見て」を繰り返すと、本体が再起動することがある（ヒープ破損のassert、またはオーディオタスクの例外）。原因未特定。直近の4回の試験では0回 |
 | 積分制御の実機での効果、Wi-Fi断からの回復 | 未検証 |
 
 追従制御の比較は閉ループの**シミュレーションのみ**（[docs/sim](docs/sim/README.md)、`tools/track_sim.py`）。実機の性能ではない。

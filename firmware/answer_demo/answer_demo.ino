@@ -44,18 +44,18 @@ extern const uint8_t rootca_crt_bundle_end[] asm("_binary_x509_crt_bundle_end");
 // ---- configuration ---------------------------------------------------------------
 static const char* kApiUrl = "https://api.sarashina.ai/v1/chat/completions";
 static const char* kModel = "sarashina3-nano";            // 60 RPM; mini is 6 RPM
-static const char* kTtsUrl = "https://api.openai.com/v1/audio/speech";
-static const char* kTtsModel = "gpt-4o-mini-tts";          // OpenAI marks it deprecated, shutdown 2027-01-06
-static const char* kTtsVoice = "coral";
-static const char* kTtsStyle = "明るく親しみやすい、少し高めの声の日本語で、はっきり話してください。";
+static const char* kTtsUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-tts:generateContent";
+static const char* kTtsVoice = "Kore";
+static const char* kLookSystemPrompt = "あなたは小さな卓上ロボットです。画像と【状況】から、見えている人の位置や様子、持ち物、周りの状況を、日本語の2文、合計60文字以内で説明してください。";
 // Optional vision: one camera frame (JPEG) goes to a multimodal cloud model, only when the
 // operator enables it on the web page and only for an explicit "look" or an autonomous ask.
 static const char* kLookUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";   // 2.5 models answered 404 for this key (2026-10-30)
 static const char* kLookPrompt = "添付の画像は、あなたの目(カメラ)に今映っているものです。見えているものに触れて、ロボットとして一言で話しかけてください。";
 static constexpr uint32_t kHttpTimeoutMs = 12000;          // < core timeout (15000)
-static constexpr uint32_t kTtsTimeoutMs = 9000;
-static constexpr size_t kTtsMaxBytes = 24000 * 2 * 8;      // 8 s of 24 kHz 16-bit mono
-static constexpr size_t kMaxAnswerBytes = 180;
+static constexpr uint32_t kTtsTimeoutMs = 12000;
+static constexpr size_t kTtsMaxBytes = 24000 * 2 * 12;     // 12 s of 24 kHz 16-bit mono
+static constexpr size_t kTtsRawMax = 900 * 1024;           // JSON reply with base64 audio
+static constexpr size_t kMaxAnswerBytes = 300;
 static constexpr uint32_t kAnswerShowMs = 6000;            // minimum caption time; longer while speaking
 static constexpr uint32_t kLongPressMs = 900;
 static constexpr int kYawMax = 450;                        // 10 = 1 deg -> +-45 deg
@@ -104,6 +104,7 @@ static void micReleased(void*, void* data, size_t length) {
   M5.Mic.record((int16_t*)data, length, 16000);            // keep capturing (allowed from this callback)
 }
 static void startMic() {
+  M5.Speaker.stop();
   M5.Speaker.end();
   M5.Mic.setBufferReleaseCallback(nullptr, micReleased);
   if (M5.Mic.begin()) {
@@ -132,7 +133,7 @@ static void sayClip(int id) {
 
 // ---- API task plumbing -----------------------------------------------------------
 struct Req { uint64_t id; char prompt[256]; uint8_t* jpg; uint32_t jpgLen; };   // jpg: malloc'd, owned and freed by apiTask
-static volatile bool visionEnabled = false;                // opt-in from the web page: sends camera frames to the cloud
+static volatile int judgeMode = 0;                         // 0 on-board only (no images leave), 1 Gemini only for an explicit "look", 2 Gemini also for autonomous asks
 struct Res { uint64_t id; bool ok; int http; uint32_t ms; uint32_t pcmBytes; int ttsHttp; uint32_t ttsMs; char text[kMaxAnswerBytes + 1]; };
 static QueueHandle_t reqQ, resQ;
 static uint8_t* ttsBuf = nullptr;                          // PSRAM; 24 kHz s16le from the TTS service
@@ -147,54 +148,77 @@ static bool validAnswer(const char* s, size_t n) {
   return true;
 }
 
-// Fetches speech for `text` into ttsBuf. Returns the byte count (0 = no audio) and sets `code`.
+// Fetches speech for `text` into ttsBuf (24 kHz s16le). Returns the byte count (0 = no audio) and
+// sets `code`. The reply is JSON with the audio as base64 in candidates[0].content.parts[0].inlineData.
 static size_t fetchTts(const char* text, int& code) {
   code = 0;
-  if (!ttsBuf || !ttsEnabled || !strlen(OPENAI_API_KEY)) return 0;
+  if (!ttsBuf || !ttsEnabled || !strlen(GEMINI_API_KEY)) return 0;
   for (int i = 0; i < 80 && ttsHeld; ++i) vTaskDelay(pdMS_TO_TICKS(100));   // previous clip still playing
   if (ttsHeld) { code = -300; return 0; }
+  char* raw = (char*)ps_malloc(kTtsRawMax + 1);
+  if (!raw) { code = -102; return 0; }
+  JsonDocument req;
+  req["contents"][0]["parts"][0]["text"] = text;
+  req["generationConfig"]["responseModalities"][0] = "AUDIO";
+  req["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] = kTtsVoice;
+  String body; serializeJson(req, body);
   WiFiClientSecure cli;
   cli.setCACertBundle(rootca_crt_bundle_start, rootca_crt_bundle_end - rootca_crt_bundle_start);
   HTTPClient http;
-  http.useHTTP10(true);                                    // no chunked framing: the body is raw PCM until close
+  http.useHTTP10(true);                                    // no chunked framing: the body ends at close
   http.setTimeout(kTtsTimeoutMs);
-  if (!http.begin(cli, kTtsUrl)) { code = -101; return 0; }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
-  JsonDocument req;
-  req["model"] = kTtsModel;
-  req["voice"] = kTtsVoice;
-  req["input"] = text;
-  req["instructions"] = kTtsStyle;
-  req["response_format"] = "pcm";
-  String body; serializeJson(req, body);
-  code = http.POST(body);
   size_t n = 0;
+  if (!http.begin(cli, kTtsUrl)) { code = -101; free(raw); return 0; }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-goog-api-key", GEMINI_API_KEY);
+  code = http.POST(body);
   if (code == 200) {
-    WiFiClient* s = http.getStreamPtr();
+    WiFiClient* st = http.getStreamPtr();
+    size_t rawN = 0;
     const uint32_t t0 = millis();
-    while (n < kTtsMaxBytes && millis() - t0 < kTtsTimeoutMs && (s->connected() || s->available())) {
-      const int a = s->available();
-      if (a > 0) n += s->readBytes(ttsBuf + n, min((size_t)a, kTtsMaxBytes - n));
+    while (rawN < kTtsRawMax && millis() - t0 < kTtsTimeoutMs && (st->connected() || st->available())) {
+      const int a = st->available();
+      if (a > 0) rawN += st->readBytes(raw + rawN, min((size_t)a, kTtsRawMax - rawN));
       else vTaskDelay(pdMS_TO_TICKS(5));
     }
-    n &= ~(size_t)1;
+    raw[rawN] = 0;
+    const char* k = strstr(raw, "\"data\"");
+    const char* q1 = k ? strchr(k + 6, '"') : nullptr;       // opening quote of the base64 value
+    const char* q2 = q1 ? strchr(q1 + 1, '"') : nullptr;
+    if (q1 && q2) {
+      size_t outLen = 0;
+      if (mbedtls_base64_decode(ttsBuf, kTtsMaxBytes, &outLen, (const uint8_t*)q1 + 1, q2 - q1 - 1) == 0 || outLen > 0) {
+        size_t off = 0, len = outLen;
+        if (outLen > 44 && memcmp(ttsBuf, "RIFF", 4) == 0) {   // WAV: walk the chunks to the audio; a metadata chunk follows it (played as static if kept)
+          size_t i = 12;
+          while (i + 8 <= outLen) {
+            uint32_t sz;
+            memcpy(&sz, ttsBuf + i + 4, 4);
+            if (memcmp(ttsBuf + i, "data", 4) == 0) { off = i + 8; len = min((size_t)sz, outLen - off); break; }
+            i += 8 + sz + (sz & 1);
+          }
+          if (!off) len = 0;
+        }
+        n = len & ~(size_t)1;
+        if (off) memmove(ttsBuf, ttsBuf + off, n);
+      }
+    }
     if (n < 2400) { code = -301; n = 0; }                  // under 50 ms: not usable audio
   }
   http.end();
+  free(raw);
   if (n) ttsHeld = true;
   return n;
 }
 
-// One image + prompt to the multimodal model. Returns the HTTP code (200 = text filled).
 static int askGemini(const char* prompt, const uint8_t* jpg, size_t jpgLen, char* text, size_t cap) {
   JsonDocument d;
-  d["systemInstruction"]["parts"][0]["text"] = kSystemPrompt;
+  d["systemInstruction"]["parts"][0]["text"] = kLookSystemPrompt;
   JsonObject p0 = d["contents"][0]["parts"][0].to<JsonObject>();
   p0["inline_data"]["mime_type"] = "image/jpeg";
   p0["inline_data"]["data"] = "@@";
   d["contents"][0]["parts"][1]["text"] = prompt;
-  d["generationConfig"]["maxOutputTokens"] = 300;           // headroom in case the model spends tokens on thinking
+  d["generationConfig"]["maxOutputTokens"] = 500;           // headroom in case the model spends tokens on thinking
   String s; serializeJson(d, s);
   const int at = s.indexOf("@@");
   size_t b64 = 0;
@@ -429,7 +453,7 @@ static bool startPrompt(const char* prompt, int tag, uint32_t now, uint8_t* jpg 
 // Take one camera frame and ask the multimodal model about it. The JPEG lives only in RAM until
 // the request is done; it is never stored or logged.
 static bool startLook(uint32_t now) {
-  if (!visionEnabled || !strlen(GEMINI_API_KEY) || !cameraOk || !CoreS3.Camera.get()) return false;
+  if (judgeMode == 0 || !strlen(GEMINI_API_KEY) || !cameraOk || !CoreS3.Camera.get()) return false;
   uint8_t* jpg = nullptr;
   size_t len = 0;
   const bool ok = frame2jpg(CoreS3.Camera.fb, 50, &jpg, &len);
@@ -477,7 +501,7 @@ button{font-size:1.05em;padding:.5em .9em;margin:.2em}input{width:100%;font-size
 <p><button onclick="ask(0)">豆知識</button><button onclick="ask(1)">応援</button><button onclick="ask(2)">休憩</button></p>
 <p><input id="q" maxlength="40" placeholder="自由に質問(40文字まで)"><button onclick="askText()">送信</button></p>
 <p><button onclick="post('/cancel')">中止</button><button onclick="post('/touch')">タッチ反応</button><button onclick="post('/view')">本体の表示切替</button></p>
-<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button><button id="b_vision" onclick="opt('vision')">視覚(画像をクラウドへ送る)</button><button onclick="post('/look')">見て</button></p>
+<p><button id="b_stream" onclick="post('/stream')">カメラ配信</button><button id="b_auto" onclick="opt('auto')">自律</button><button id="b_mute" onclick="opt('mute')">消音</button><button id="b_tts" onclick="opt('tts')">読み上げ</button><button id="b_mic" onclick="opt('mic')">マイク</button><button id="b_mode" onclick="opt('mode')">追従方式</button><button id="b_vision" onclick="opt('vision')">判断</button><button onclick="post('/look')">見て</button></p>
 <script>
 const t=new URLSearchParams(location.search).get('t')||'';
 async function post(p,b){const r=await fetch(p+'?t='+encodeURIComponent(t),{method:'POST',body:b});if(!r.ok)document.getElementById('st').textContent='エラー '+r.status;}
@@ -514,7 +538,7 @@ for(const e of j.ev){if(e.s>lastSeq){lastSeq=e.s;events.push({t:e.ms+off,n:e.n,a
 document.getElementById('st').textContent='状態: '+j.state+' / 顔追従: '+(j.track?'あり':'なし')+'\n'+(j.answer||j.status||'');
 document.getElementById('n_fps').textContent='検出 '+j.fps.toFixed(1)+' fps';document.getElementById('n_api').textContent='API '+j.api_ms+' ms';
 document.getElementById('n_mic').textContent='音 '+j.mic+(j.mic_on?'':' (停止中)');document.getElementById('n_rssi').textContent='Wi-Fi '+j.rssi+' dBm';
-mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);mark('b_vision',j.vision);document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
+mark('b_stream',j.stream);mark('b_auto',j.auto);mark('b_mute',j.mute);mark('b_tts',j.tts);mark('b_mic',j.mic_allowed);mark('b_vision',j.vision);document.getElementById('b_vision').textContent='判断: '+['本体のみ(画像は送らない)','「見て」のときだけGemini','常にGemini'][j.vision];document.getElementById('b_mode').textContent='追従方式: '+['顔検出','動き','顔→動き'][j.mode];
 streaming=j.stream;box=j.box;if(streaming&&!looping)loop();if(!streaming)loop();}catch(e){}draw();}
 setInterval(poll,500);poll();
 </script></html>
@@ -557,7 +581,7 @@ static void setupWeb() {
     j["auto"] = autoOn;
     j["mute"] = muted;
     j["tts"] = ttsEnabled;
-    j["vision"] = visionEnabled;
+    j["vision"] = (int)judgeMode;
     j["vision_key"] = strlen(GEMINI_API_KEY) > 0;
     j["fault"] = (int)faultMode;
     j["now"] = millis();
@@ -602,7 +626,7 @@ static void setupWeb() {
   web.on("/look", HTTP_POST, [] {
     if (!authorized()) return;
     const uint32_t now = millis();
-    if (!visionEnabled) { web.send(409, "text/plain", "vision off"); return; }
+    if (judgeMode == 0) { web.send(409, "text/plain", "vision off"); return; }
     if (now - lastWebAskMs < 2000) { web.send(429, "text/plain", "slow down"); return; }
     const bool ok = startLook(now);
     if (ok) { lastWebAskMs = now; SAY(ASK); }
@@ -622,7 +646,7 @@ static void setupWeb() {
     else if (n == "mute") { v = muted = !muted; if (muted) M5.Speaker.stop(); }
     else if (n == "tts") v = ttsEnabled = !ttsEnabled;
     else if (n == "mic") v = micAllowed = !micAllowed;
-    else if (n == "vision") v = visionEnabled = !visionEnabled;
+    else if (n == "vision") { judgeMode = (judgeMode + 1) % 3; v = judgeMode != 0; }
     else if (n == "mode") { trackMode = (trackMode + 1) % 3; prevValid = false; v = trackMode != 0; }
     else if (n == "fault") { const int m = web.arg("v").toInt(); if (m < 0 || m > 3) { web.send(400, "text/plain", "bad fault"); return; } faultMode = m; v = m != 0; }
     else { web.send(400, "text/plain", "bad option"); return; }
@@ -729,10 +753,14 @@ static void drawCaption() {
   if (!answer[0] && !status[0]) return;
   auto& d = canvas;
   d.setFont(&fonts::lgfxJapanGothic_16);
-  d.fillRoundRect(6, 172, d.width() - 12, 62, 10, 0x2104);
+  const char* t = answer[0] ? answer : status;
+  const int chars = (int)strlen(t) / 3 + 1;                 // mostly 3-byte Japanese characters
+  const int lines = constrain((chars + 17) / 18, 3, 6);
+  const int h = lines * 19 + 8;
+  d.fillRoundRect(6, 236 - h, d.width() - 12, h, 10, 0x2104);
   d.setTextColor(answer[0] ? TFT_WHITE : TFT_ORANGE, 0x2104);
-  d.setCursor(14, 178);
-  d.print(answer[0] ? answer : status);
+  d.setCursor(14, 242 - h);
+  d.print(t);
 }
 
 // Operator status bar, shown only in the camera/debug view.
@@ -777,7 +805,7 @@ void setup() {
     }
   }
   Serial.printf("setup wifi=%d key_set=%d tts_key_set=%d tts_buf=%d voice_clips=%d free_heap=%u free_psram=%u\n", (int)wifiOk,
-                (int)(strlen(SARASHINA_API_KEY) > 0), (int)(strlen(OPENAI_API_KEY) > 0), (int)(ttsBuf != nullptr),
+                (int)(strlen(SARASHINA_API_KEY) > 0), (int)(strlen(GEMINI_API_KEY) > 0), (int)(ttsBuf != nullptr),
                 (int)VOICE_CLIPS_AVAILABLE, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   if (wifiOk) {
     MDNS.begin("stackchan");
@@ -922,11 +950,14 @@ void loop() {
   // Microphone: listen while silent; a sudden loud sound makes the robot react (face, voice),
   // also while it waits for the cloud. Nothing is recorded, stored or sent: only a level.
   if (speaking || ttsPlaying) lastAudioMs = now;
-  if (!micOn && micAllowed && !micFailed && !speaking && !ttsPlaying && now - lastAudioMs > 600) {
+  // The microphone pauses while a request is in flight: with it running, the TLS work on the other
+  // core starved the I2S reader into an interrupt watchdog reset (seen 2026-10-30, look + TTS).
+  const bool micWanted = micAllowed && out.state != State::waiting;
+  if (!micOn && micWanted && !micFailed && !speaking && !ttsPlaying && now - lastAudioMs > 1500) {   // let the speaker task drain before the port is switched
     startMic();
     logEvent(micOn ? "mic_on" : "mic_failed", now);
   }
-  if (micOn && !micAllowed) { M5.Mic.end(); micOn = false; }
+  if (micOn && !micWanted) { M5.Mic.end(); micOn = false; micLevel = 0; }
   // The servo motor is loud: sounds in the 1.2 s after a head command are ignored (observed 2026-10-30).
   if (micOn && now - micStartMs > 700 && now - lastMoveMs > 1200) {
     const uint32_t lvl = micLevel;
@@ -954,7 +985,7 @@ void loop() {
       logEvent("auto_greet", now);
       break;
     case Act::ask: {
-      if (visionEnabled && strlen(GEMINI_API_KEY)) {
+      if (judgeMode == 2 && strlen(GEMINI_API_KEY)) {
         if (startLook(now)) { SAY(ASK); logEvent("auto_look", now); }
         break;
       }
@@ -1025,8 +1056,8 @@ void loop() {
                   (unsigned long)acceptedN, (unsigned long)rejectedN, (unsigned)ESP.getFreeHeap(),
                   (unsigned long)tLoopMax, (unsigned long)tWebMax, (unsigned long)tCamMax, (unsigned long)tDrawMax);
     lastFps = frames * 1000.0F / (now - lastFaceLogMs);
-    Serial.printf("device_monotonic_ms=%lu mic on=%d level=%lu window_max=%lu floor=%.0f\n", (unsigned long)now, (int)micOn,
-                  (unsigned long)micLevel, (unsigned long)micWindowMax, micFloor);
+    Serial.printf("device_monotonic_ms=%lu mic on=%d level=%lu window_max=%lu floor=%.0f heap_ok=%d\n", (unsigned long)now, (int)micOn,
+                  (unsigned long)micLevel, (unsigned long)micWindowMax, micFloor, (int)heap_caps_check_integrity_all(false));
     micWindowMax = 0;
     frames = faceFrames = trackFrames = servoCmds = 0;
     windowMaxQ = 0;
