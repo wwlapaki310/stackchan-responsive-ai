@@ -4,6 +4,8 @@
 
 M5Stack Stack-chan K151 に、本体上の顔検出と首の追従制御（エッジAI）、クラウドのLLM/VLM（Sarashina・Gemini）を、役割分担させたデモ。本体で分かること（顔の有無・向き・音量）は本体だけで処理し、分からないこと（何をしているか・何を持っているか）だけを、クラウドへ聞く。回答を待つ間も、追従・相づち・タッチ反応を止めない。通常動作は、本体とWi-Fiとクラウドだけで完結する（PC側のプロキシは使わない）。
 
+**English summary.** A Stack-chan K151 (ESP32-S3) robot that splits perception between the edge and the cloud: face detection (pico), motion and loudness sensing run on the board and drive a closed-loop head tracking controller; only what the board cannot tell (what is happening, what the person holds) is sent as a single camera frame to a cloud VLM (Gemini), and text questions go to an LLM (Sarashina). Images are sent only on request (off by default). MIT licensed. Demo video and report: see links below.
+
 > 状態（2026-10-30）: 実機で動く作業版。評価実験は未実施で、論文は作業草稿。確認済みと未確認は[「確認状況」](#確認状況)に分けて書く。
 
 - デモ動画: （撮影後にYouTubeのURLを追記）
@@ -12,24 +14,15 @@ M5Stack Stack-chan K151 に、本体上の顔検出と首の追従制御（エ�
 
 ## 何ができるか
 
-- **見る**: 本体カメラ（320×240）の画像から、本体上で顔検出（pico）または画像の変動（フレーム差分）を行い、首（yaw）を向ける。方式はWebから切り替えられる。
+- **見る（本体）**: 本体カメラ（320×240）の画像から、本体上で顔検出（pico）または画像の変動（フレーム差分）を行い、首（yaw）を向ける。方式はWebから切り替えられる。
+- **探す（監視モード）**: 誰もいないとき、首を左右±110°まで振って人を探す。見つけたら、追従に切り替える。
 - **考える（クラウド）**: 顔を見つけて約3秒たつと、自分からSarashina APIへ質問する（Webやタッチでも質問できる）。回答は字幕で出す。
+- **見て（クラウドVLM）**: 「見て」で、カメラ1枚をGeminiへ送り、状況の説明文を字幕と声で返す。送るかどうかは「判断」ボタンで選ぶ（既定は送らない）。
 - **待つ間も止まらない**: 回答を待つ間も、顔追従・表情・タッチ反応・「えーっと」の相づちを続ける。回答が遅れて届いても、キャンセル済みや古い要求なら捨てる。
-- **声と音**: 固定フレーズ（起動・挨拶・考え中・中止・エラーなど）を、本体のスピーカーで話す。マイクは音量だけを見て、大きな音に反応する（録音・保存・送信はしない）。
+- **声と音**: 固定フレーズを、本体のスピーカーで話す。マイクは音量だけを見て、大きな音に反応する（録音・保存・送信はしない）。
 - **操作画面**: 同じLAN内のブラウザで、首の角度の推移、回答待ちの時間帯、イベント、カメラ映像と検出枠を見られる。本体の画面は顔と字幕だけにしている。
 
 ## 構成
-
-```
-                 ┌────────────── M5Stack Stack-chan K151（CoreS3: ESP32-S3, 8MB PSRAM）──────────────┐
-  カメラ ───────▶│ loop()（単一所有者）                                                                  │
-  タッチ ───────▶│  顔検出(pico) / 動き検出 ─▶ 追従制御（積分）─▶ サーボ（yaw）                           │
-  マイク ───────▶│  portable core: Interaction（状態・鮮度・キャンセル） + Director（自律動作の方針）      │──▶ 画面（顔・字幕）
-                 │  Web操作画面（LAN, トークン）                                                         │──▶ スピーカー
-                 │        ▲ キュー（要求1・結果2）                                                       │
-                 │  apiTask（別タスク）: HTTPS ──────────────────────────────────────────────────────────┼──▶ Sarashina API（TLS検証）
-                 └──────────────────────────────────────────────────────────────────────────────────────┘
-```
 
 ![システム構成図](docs/img/architecture.png)
 
