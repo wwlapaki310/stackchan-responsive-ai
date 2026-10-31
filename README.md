@@ -120,6 +120,10 @@ M5Stack公式の[StackChan Issue #70](https://github.com/m5stack/StackChan/issue
 
 GitHubを正本にする。作業終了時にコミットしてpushし、別PCではfetch/pullしてから再開する。force pushしない。
 
+## 関連する取り組み（本課題の範囲外・参考）
+
+本プロジェクトは、シミュレータではなく実機で動かすことにこだわった。以前の取り組み: Unitreeハッカソンでのシミュレーションと実機の動画（[1](https://youtube.com/shorts/tFogxTEo6s0)、[2](https://youtu.be/ACIyAEap29A)）、Robotic Academy「Follow Line by PID Control」でGazebo/ROSを動かした動画（[動画](https://youtu.be/QBND0NXNwVM)）。
+
 ## データとライセンス
 
 APIキー、Wi-Fi情報、生画像、私的会話、機器ダンプ、講座PDFをコミットしない。MITライセンス（[LICENSE](LICENSE)）。第三者の成果物は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
