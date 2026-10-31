@@ -3,6 +3,7 @@
 **追従制御・エッジAI（顔）・クラウドLLM（Sarashina/Gemini）を組み合わせた、小型ロボットの環境認識と応答制御**
 
 - リポジトリ: https://github.com/wwlapaki310/stackchan-responsive-ai （MITライセンス）
+- デモ動画: https://youtu.be/MchQt4YmAqU
 - 状態: 2026-10-30時点の作業版。評価実験は未実施。論文（`paper/`）は作業草稿で、完成した研究ではない。
 
 ## 1. 何を作ったか

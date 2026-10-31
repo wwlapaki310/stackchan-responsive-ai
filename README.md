@@ -8,7 +8,7 @@ M5Stack Stack-chan K151 に、本体上の顔検出と首の追従制御（エ�
 
 > 状態（2026-10-30）: 実機で動く作業版。評価実験は未実施で、論文は作業草稿。確認済みと未確認は[「確認状況」](#確認状況)に分けて書く。
 
-- デモ動画: （撮影後にYouTubeのURLを追記）
+- デモ動画: https://youtu.be/MchQt4YmAqU
 - 説明資料: [docs/SUBMISSION.md](docs/SUBMISSION.md)（実装と計画の区別、実機の記録、限界）
 - 動画の台本: [docs/DEMO.md](docs/DEMO.md)　構成の詳細: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)　シミュレーション: [docs/sim](docs/sim/README.md)
 
